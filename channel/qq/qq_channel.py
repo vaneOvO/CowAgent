@@ -447,15 +447,29 @@ class QQChannel(ChatChannel):
         from channel.file_cache import get_file_cache
         file_cache = get_file_cache()
 
-        if is_group:
-            session_id = qq_msg.other_user_id
-        else:
-            session_id = qq_msg.from_user_id
+        session_id = self._compute_session_id(qq_msg, is_group)
 
         if qq_msg.ctype == ContextType.IMAGE:
             if hasattr(qq_msg, "image_path") and qq_msg.image_path:
                 file_cache.add(session_id, qq_msg.image_path, file_type="image")
                 logger.info(f"[QQ] Image cached for session {session_id}")
+            return
+
+        # A standalone file / video / voice message carries no text to answer,
+        # so cache it (like an image) for the user's next question instead of
+        # producing an empty context. Without this the attachment was silently
+        # dropped and the agent "received nothing".
+        if qq_msg.ctype == ContextType.FILE:
+            fpath = getattr(qq_msg, "file_path", None)
+            if fpath:
+                ftype = getattr(qq_msg, "file_type", None) or "file"
+                # FileCache understands image/video/other; map voice to a generic
+                # file bucket so it still renders as [文件: ...] downstream.
+                cache_type = ftype if ftype in ("image", "video") else "file"
+                file_cache.add(session_id, fpath, file_type=cache_type)
+                logger.info(f"[QQ] {ftype} cached for session {session_id}: {fpath}")
+            else:
+                logger.warning("[QQ] File message had no downloadable attachment")
             return
 
         if qq_msg.ctype == ContextType.TEXT:
@@ -491,6 +505,24 @@ class QQChannel(ChatChannel):
     # _compose_context
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _compute_session_id(qq_msg, is_group: bool) -> str:
+        """The conversation key for an inbound message.
+
+        A group shares one session only when ``group_shared_session`` asks for
+        it; otherwise every member gets their own, which is the rule the base
+        ``chat_channel`` and the other group channels (dingtalk, discord,
+        feishu, slack, telegram, wecom_bot) already apply. QQ keyed a group on
+        the group id unconditionally, so the setting -- and its shipped default
+        of False -- was a silent no-op here, and every member of a QQ group
+        shared one conversation.
+        """
+        if not is_group:
+            return qq_msg.from_user_id
+        if conf().get("group_shared_session", True):
+            return qq_msg.other_user_id
+        return f"{qq_msg.from_user_id}:{qq_msg.other_user_id}"
+
     def _compose_context(self, ctype: ContextType, content, **kwargs):
         context = Context(ctype, content)
         context.kwargs = kwargs
@@ -498,14 +530,15 @@ class QQChannel(ChatChannel):
             context["channel_type"] = self.channel_type
         self.stamp_instance_context(context)
         if "origin_ctype" not in context:
-            context["origin_ctype"] = ctype
+            # A voice message promoted to TEXT via QQ's official ASR carries
+            # its VOICE origin on the message wrapper (QQMessage.origin_ctype);
+            # surface it here so downstream plugins can tell voice-origin
+            # messages apart, mirroring how other channels stamp origin_ctype.
+            context["origin_ctype"] = getattr(kwargs.get("msg"), "origin_ctype", None) or ctype
 
         cmsg = context["msg"]
 
-        if cmsg.is_group:
-            context["session_id"] = cmsg.other_user_id
-        else:
-            context["session_id"] = cmsg.from_user_id
+        context["session_id"] = self._compute_session_id(cmsg, cmsg.is_group)
 
         context["receiver"] = cmsg.other_user_id
 
@@ -546,7 +579,11 @@ class QQChannel(ChatChannel):
             if hasattr(reply, "text_content") and reply.text_content:
                 self._send_text(reply.text_content, msg, event_type, msg_id)
                 time.sleep(0.3)
-            self._send_file(reply.content, msg, event_type, msg_id)
+            # The bridge stamps the original filename on the reply; a cloud URL's
+            # last path segment is a random hash, so pass it through to keep the
+            # document's real name (extension included).
+            self._send_file(reply.content, msg, event_type, msg_id,
+                            file_name=getattr(reply, "file_name", ""))
         elif reply.type in (ReplyType.VIDEO, ReplyType.VIDEO_URL):
             self._send_media(reply.content, msg, event_type, msg_id, QQ_FILE_TYPE_VIDEO)
         else:
@@ -596,16 +633,20 @@ class QQChannel(ChatChannel):
 
         return None, None, None, None
 
-    def _post_message(self, url: str, body: dict, event_type: str):
+    def _post_message(self, url: str, body: dict, event_type: str) -> bool:
+        """POST a message to the QQ API. Returns True on success so callers can
+        fall back (e.g. Markdown -> plain text) when the platform rejects it."""
         try:
             resp = requests.post(url, json=body, headers=self._get_auth_headers(), timeout=10)
             if resp.status_code in (200, 201, 202, 204):
                 logger.info(f"[QQ] Message sent successfully: event_type={event_type}")
-            else:
-                logger.error(f"[QQ] Failed to send message: status={resp.status_code}, "
-                             f"body={resp.text}")
+                return True
+            logger.error(f"[QQ] Failed to send message: status={resp.status_code}, "
+                         f"body={resp.text}")
+            return False
         except Exception as e:
             logger.error(f"[QQ] Send message error: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Active send (no original message, e.g. scheduled tasks)
@@ -636,6 +677,21 @@ class QQChannel(ChatChannel):
         if not url:
             logger.warning(f"[QQ] Cannot send reply for event_type: {event_type}")
             return
+        # QQ renders Markdown only via msg_type=2. Custom Markdown is open to all
+        # bots in single (C2C) and group chat (since 2026-04-23), so use it there;
+        # the guild channel / DM APIs need a template (or internal invite), so
+        # those stay plain text. Empty content can't be a Markdown body either.
+        if content and event_type in ("GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
+            md_body = dict(body)
+            md_body["msg_type"] = 2
+            md_body["markdown"] = {"content": content}
+            # A bot whose Markdown is restricted (or content that trips QQ's
+            # Markdown validator) rejects msg_type=2; fall back to plain text so
+            # the user still gets the reply instead of nothing.
+            if self._post_message(url, md_body, event_type):
+                return
+            logger.warning("[QQ] Markdown send rejected, retrying as plain text")
+            body["msg_seq"] = self._get_next_msg_seq(msg_id)
         body["content"] = content
         body["msg_type"] = 0
         self._post_message(url, body, event_type)
@@ -644,8 +700,20 @@ class QQChannel(ChatChannel):
     # Rich media upload & send (image / video / file)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _filename_from_url(file_url: str) -> str:
+        """Best-effort filename from a URL: the last path segment if it has an
+        extension. Returns '' when the URL ends in an opaque token (no '.')."""
+        try:
+            from urllib.parse import urlparse, unquote
+            path = urlparse(file_url).path
+            name = unquote(os.path.basename(path))
+            return name if "." in name else ""
+        except Exception:
+            return ""
+
     def _upload_rich_media(self, file_url: str, file_type: int, msg: QQMessage,
-                           event_type: str) -> str:
+                           event_type: str, file_name: str = "") -> str:
         """
         Upload media via QQ rich media API and return file_info.
         For group: POST /v2/groups/{group_openid}/files
@@ -667,6 +735,13 @@ class QQChannel(ChatChannel):
             "url": file_url,
             "srv_send_msg": False,
         }
+        # For documents, pass an explicit name so it doesn't render as "未命名".
+        # The URL's last path segment is often a random hash, so prefer the
+        # caller-supplied name when present.
+        if file_type == QQ_FILE_TYPE_FILE:
+            file_name = file_name or self._filename_from_url(file_url)
+            if file_name:
+                upload_body["file_name"] = file_name
 
         try:
             resp = requests.post(
@@ -688,7 +763,7 @@ class QQChannel(ChatChannel):
             return ""
 
     def _upload_rich_media_base64(self, file_path: str, file_type: int, msg: QQMessage,
-                                  event_type: str) -> str:
+                                  event_type: str, file_name: str = "") -> str:
         """Upload local file via base64 file_data field."""
         if event_type == "GROUP_AT_MESSAGE_CREATE":
             group_openid = msg._rawmsg.get("group_openid", "")
@@ -713,6 +788,13 @@ class QQChannel(ChatChannel):
             "file_data": file_data,
             "srv_send_msg": False,
         }
+        # base64 carries no filename, so without file_name a document shows
+        # with no extension. Only files (file_type=4) display a name. Prefer the
+        # caller-supplied original name (the local tmp path may be a random one).
+        if file_type == QQ_FILE_TYPE_FILE:
+            file_name = file_name or os.path.basename(file_path)
+            if file_name:
+                upload_body["file_name"] = file_name
 
         try:
             resp = requests.post(
@@ -767,7 +849,8 @@ class QQChannel(ChatChannel):
         else:
             self._send_text("[Image upload failed]", msg, event_type, msg_id)
 
-    def _send_file(self, file_path_or_url: str, msg: QQMessage, event_type: str, msg_id: str):
+    def _send_file(self, file_path_or_url: str, msg: QQMessage, event_type: str, msg_id: str,
+                   file_name: str = ""):
         """Send file reply."""
         if event_type not in ("GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
             self._send_text(str(file_path_or_url), msg, event_type, msg_id)
@@ -778,10 +861,10 @@ class QQChannel(ChatChannel):
 
         if file_path_or_url.startswith(("http://", "https://")):
             file_info = self._upload_rich_media(
-                file_path_or_url, QQ_FILE_TYPE_FILE, msg, event_type)
+                file_path_or_url, QQ_FILE_TYPE_FILE, msg, event_type, file_name=file_name)
         elif os.path.exists(file_path_or_url):
             file_info = self._upload_rich_media_base64(
-                file_path_or_url, QQ_FILE_TYPE_FILE, msg, event_type)
+                file_path_or_url, QQ_FILE_TYPE_FILE, msg, event_type, file_name=file_name)
         else:
             logger.error(f"[QQ] File not found: {file_path_or_url}")
             self._send_text("[File send failed]", msg, event_type, msg_id)

@@ -106,6 +106,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   checkForUpdate: (lang?: string) => ipcRenderer.invoke('update-check', lang),
   downloadUpdate: (lang?: string) => ipcRenderer.invoke('update-download', lang),
   installUpdate: () => ipcRenderer.invoke('update-install'),
+  // Extra query parameters for the update feed URL; pass {} to clear.
+  setUpdateFeedQuery: (params: Record<string, string>) => ipcRenderer.invoke('update-feed-query', params),
   onUpdateStatus: (callback: (status: unknown) => void) => {
     const handler = (_event: unknown, status: unknown) => callback(status)
     ipcRenderer.on('update-status', handler)

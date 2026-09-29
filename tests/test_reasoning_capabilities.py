@@ -62,13 +62,16 @@ def test_older_claude_models_hide_effort_control():
 
 def test_dashscope_qwen38_max_exposes_native_effort_values():
     # qwen3.8-max and its -preview snapshot share the same native effort enum.
+    # They are HYBRID thinking models (thinking can be turned off), so they
+    # must NOT be marked thinking_only — otherwise the bridge would force
+    # thinking on and users could never avoid the long xhigh reasoning pass.
     for model in ("qwen3.8-max", "qwen3.8-max-preview"):
         cap = get_reasoning_capability("dashscope", model)
 
         assert cap["supported"] is True, model
         assert cap["param"] == "reasoning_effort"
         assert cap["default"] == "xhigh"
-        assert cap["thinking_only"] is True
+        assert "thinking_only" not in cap
         assert _values(cap) == ["low", "medium", "xhigh"]
 
 

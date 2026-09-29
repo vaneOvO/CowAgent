@@ -11,6 +11,7 @@ from agent.tools.base_tool import BaseTool, ToolResult
 from agent.tools.utils.credentials import is_credential_path
 from agent.tools.utils.diff import looks_like_line_numbered_block
 from agent.tools.utils.file_state import note_write, staleness_warning
+from agent.tools.utils.memory_path import feeds_memory_index
 from agent.tools.utils.syntax_check import review as syntax_review
 from common.utils import expand_path
 
@@ -95,7 +96,9 @@ class Write(BaseTool):
             bytes_written = len(content.encode('utf-8'))
             
             # Auto-sync to memory database if this is a memory file
-            if self.memory_manager and 'memory/' in path:
+            if self.memory_manager and feeds_memory_index(
+                absolute_path, self.memory_manager, self.cwd
+            ):
                 self.memory_manager.mark_dirty()
             
             result = {

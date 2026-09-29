@@ -288,9 +288,10 @@ class DashscopeBot(Bot):
             
             # Add thinking parameters for DashScope thinking-capable models.
             model_lower = model_name.lower()
-            # qwen3.8-max / qwen3.8-flash (and their -preview snapshots) always
-            # think and are controlled via reasoning_effort (default xhigh), not
-            # enable_thinking on/off. Treat the whole qwen3.8 family the same way.
+            # qwen3.8-max / qwen3.8-flash (and their -preview snapshots) are
+            # HYBRID thinking models: thinking is on by default but can be
+            # turned off via enable_thinking=false. When thinking is on they
+            # take reasoning_effort (default xhigh) instead of thinking_budget.
             is_qwen38_effort_model = model_lower.startswith("qwen3.8-")
             supports_thinking = (
                 "qwen3" in model_lower
@@ -298,13 +299,16 @@ class DashscopeBot(Bot):
                 or model_lower.startswith(("glm-", "deepseek-v4-", "kimi/kimi-k3"))
             )
             if supports_thinking:
-                if is_qwen38_effort_model:
-                    # qwen3.8 effort models require enable_thinking=True but
-                    # should not expose raw thinking text in the response.
-                    parameters["preserve_thinking"] = False
+                # Honor the caller's thinking toggle. qwen3.8 is hybrid, so a
+                # disabled toggle must actually disable thinking (this is what
+                # lets a user avoid the long xhigh reasoning pass).
                 thinking = kwargs.get("thinking", {"type": "enabled"})
-                if thinking.get("type") == "enabled" or is_qwen38_effort_model:
+                if thinking.get("type") == "enabled":
                     parameters["enable_thinking"] = True
+                    if is_qwen38_effort_model:
+                        # Effort models keep the raw thinking text out of the
+                        # stored response but still stream reasoning_content.
+                        parameters["preserve_thinking"] = False
                     reasoning_effort = kwargs.get("reasoning_effort")
                     if reasoning_effort:
                         parameters["reasoning_effort"] = reasoning_effort

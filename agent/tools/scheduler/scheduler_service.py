@@ -7,8 +7,16 @@ import inspect
 import threading
 from datetime import datetime, timedelta
 from typing import Callable, Optional
-from croniter import croniter
+
 from common.log import logger
+from agent.tools.scheduler.time_utils import (
+    format_scheduled_time,
+    next_cron_occurrence,
+    normalize_task_timestamps,
+    parse_scheduled_time,
+    scheduled_reference_time,
+    task_timezone,
+)
 
 
 def _callable_accepts_two_positional(fn: Callable) -> bool:
@@ -31,17 +39,14 @@ def _callable_accepts_two_positional(fn: Callable) -> bool:
     return len(positional) >= 2
 
 
-def _parse_naive_local(iso_str: str) -> datetime:
-    """Parse an ISO datetime and coerce it to tz-naive local time.
+def _migrate_naive_timestamps(task: dict) -> dict:
+    """Normalize persisted scheduling timestamps for one scheduler read.
 
-    The scheduler uses ``datetime.now()`` (tz-naive) for all comparisons,
-    so any persisted timestamp must be normalized to the same flavor —
-    otherwise comparing naive vs aware raises TypeError.
+    Aware values are converted to UTC. Naive values keep their historical
+    server-local meaning, unless the task explicitly declares an IANA timezone.
+    The store is not rewritten here so upgrading never mutates unrelated tasks.
     """
-    dt = datetime.fromisoformat(iso_str)
-    if dt.tzinfo is not None:
-        dt = dt.astimezone().replace(tzinfo=None)
-    return dt
+    return normalize_task_timestamps(task)
 
 
 class SchedulerService:
@@ -106,7 +111,15 @@ class SchedulerService:
     def _check_and_execute_tasks(self):
         """Check for due tasks and execute them"""
         now = datetime.now()
-        tasks = self.task_store.list_tasks(enabled_only=True)
+        tasks = []
+        for raw_task in self.task_store.list_tasks(enabled_only=True):
+            try:
+                tasks.append(_migrate_naive_timestamps(raw_task))
+            except Exception as e:
+                logger.error(
+                    f"[Scheduler] Failed to normalize timestamps for task "
+                    f"{raw_task.get('id')}: {e}"
+                )
         
         for task in tasks:
             try:
@@ -132,9 +145,10 @@ class SchedulerService:
 
                     next_run = self._calculate_next_run(task, now)
                     if next_run:
+                        completed_at = scheduled_reference_time(task, now)
                         self.task_store.update_task(task['id'], {
-                            "next_run_at": next_run.isoformat(),
-                            "last_run_at": now.isoformat()
+                            "next_run_at": format_scheduled_time(next_run),
+                            "last_run_at": format_scheduled_time(completed_at)
                         })
                     else:
                         self.task_store.delete_task(task['id'])
@@ -156,18 +170,19 @@ class SchedulerService:
         task = self.task_store.get_task(task_id)
         if not task:
             raise ValueError(f"Task '{task_id}' not found")
+        task = _migrate_naive_timestamps(task)
         if not self._claim_task(task_id):
             raise RuntimeError(f"Task '{task_id}' is already running")
 
         def _run():
-            now = datetime.now()
+            now = scheduled_reference_time(task, datetime.now())
             try:
                 logger.info(f"[Scheduler] Manually executing task: {task_id} - {task.get('name', '')}")
                 ok = self._execute_task(task, trigger="manual")
                 if ok:
                     self.task_store.update_task(task_id, {
-                        "last_run_at": now.isoformat(),
-                        "last_manual_run_at": now.isoformat(),
+                        "last_run_at": format_scheduled_time(now),
+                        "last_manual_run_at": format_scheduled_time(now),
                     })
                     logger.info(f"[Scheduler] Manual execution completed: {task_id}")
                 else:
@@ -210,16 +225,17 @@ class SchedulerService:
             next_run = self._calculate_next_run(task, now)
             if next_run:
                 self.task_store.update_task(task['id'], {
-                    "next_run_at": next_run.isoformat()
+                    "next_run_at": format_scheduled_time(next_run)
                 })
                 return False
             return False
         
         try:
-            next_run = _parse_naive_local(next_run_str)
+            reference_now = scheduled_reference_time(task, now)
+            next_run = parse_scheduled_time(next_run_str, task_timezone(task))
 
-            if next_run < now:
-                time_diff = (now - next_run).total_seconds()
+            if next_run < reference_now:
+                time_diff = (reference_now - next_run).total_seconds()
                 schedule = task.get("schedule", {})
                 schedule_type = schedule.get("type")
 
@@ -242,12 +258,12 @@ class SchedulerService:
                 next_next_run = self._calculate_next_run(task, now)
                 if next_next_run:
                     self.task_store.update_task(task['id'], {
-                        "next_run_at": next_next_run.isoformat()
+                        "next_run_at": format_scheduled_time(next_next_run)
                     })
                     logger.info(f"[Scheduler] Rescheduled task {task['id']} to {next_next_run}")
                 return False
 
-            return now >= next_run
+            return reference_now >= next_run
         except Exception as e:
             logger.error(
                 f"[Scheduler] Failed to evaluate due-state for task "
@@ -268,7 +284,8 @@ class SchedulerService:
         """
         schedule = task.get("schedule", {})
         schedule_type = schedule.get("type")
-        
+        from_time = scheduled_reference_time(task, from_time)
+
         if schedule_type == "cron":
             # Cron expression
             expression = schedule.get("expression")
@@ -276,8 +293,9 @@ class SchedulerService:
                 return None
             
             try:
-                cron = croniter(expression, from_time)
-                return cron.get_next(datetime)
+                return next_cron_occurrence(
+                    expression, from_time, task_timezone(task)
+                )
             except Exception as e:
                 logger.error(f"[Scheduler] Invalid cron expression '{expression}': {e}")
                 return None
@@ -296,7 +314,7 @@ class SchedulerService:
                 return None
             
             try:
-                run_at = _parse_naive_local(run_at_str)
+                run_at = parse_scheduled_time(run_at_str, task_timezone(task))
                 if run_at > from_time:
                     return run_at
             except Exception as e:

@@ -111,6 +111,26 @@ def _truncate_reasoning_for_storage(text: str) -> str:
     return head + _REASONING_TRUNCATE_MARKER.format(omitted=omitted) + tail
 
 
+def _cache_hit_tokens(usage: Dict[str, Any]) -> int:
+    """Prompt tokens served from the provider's prefix cache.
+
+    DeepSeek reports ``prompt_cache_hit_tokens``, OpenAI-style endpoints
+    ``prompt_tokens_details.cached_tokens`` and Claude-style ones
+    ``cache_read_input_tokens``.
+    """
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    try:
+        return int(
+            usage.get("prompt_cache_hit_tokens")
+            or cached
+            or usage.get("cache_read_input_tokens")
+            or 0
+        )
+    except (TypeError, ValueError):
+        return 0
+
+
 # Cap for the 429 incremental backoff. The base curve is 30 + retry_count*15,
 # which without a cap crosses the web channel's 600s SSE idle timeout by the
 # 8th retry; capping each wait at 60s keeps the cumulative sleep in bounds.
@@ -254,6 +274,9 @@ class AgentStreamExecutor:
 
         # Message history - use provided messages or create new list
         self.messages = messages if messages is not None else []
+        # This run's user query, the anchor callers use to find the messages
+        # the run added (see run_start_index).
+        self.run_user_message = None
         
         # Tool failure tracking for retry protection
         self.tool_failure_history = []  # List of (tool_name, args_hash, success) tuples
@@ -700,7 +723,7 @@ class AgentStreamExecutor:
         logger.info(f"🤖 {self.model.model}{thinking_label}{effort_label} | 👤 {_log_msg}")
         
         # Add user message (Claude format - use content blocks for consistency)
-        self.messages.append({
+        self.run_user_message = {
             "role": "user",
             "content": [
                 {
@@ -708,7 +731,8 @@ class AgentStreamExecutor:
                     "text": user_message
                 }
             ]
-        })
+        }
+        self.messages.append(self.run_user_message)
 
         # Trim context ONCE before the agent loop starts, not during tool steps.
         # This ensures tool_use/tool_result chains created during the current run
@@ -804,12 +828,12 @@ class AgentStreamExecutor:
                 if not tool_calls:
                     # 检查是否返回了空响应
                     if not assistant_msg:
-                        logger.warning(f"[Agent] LLM returned empty response after retry (no content and no tool calls)")
-                        logger.info(f"[Agent] This usually happens when LLM thinks the task is complete after tool execution")
+                        logger.warning("[Agent] LLM returned empty response after retry (no content and no tool calls)")
+                        logger.info("[Agent] This usually happens when LLM thinks the task is complete after tool execution")
                         
                         # 如果之前有工具调用，强制要求 LLM 生成文本回复
                         if turn > 1:
-                            logger.info(f"[Agent] Requesting explicit response from LLM...")
+                            logger.info("[Agent] Requesting explicit response from LLM...")
                             
                             # Remember position so we can remove the injected prompt later
                             prompt_insert_idx = len(self.messages)
@@ -840,12 +864,12 @@ class AgentStreamExecutor:
                             # to the tool execution path below (don't break the loop).
                             if tool_calls:
                                 logger.info(
-                                    f"[Agent] LLM returned tool_calls in explicit-response retry, "
-                                    f"continuing to execute tools instead of breaking"
+                                    "[Agent] LLM returned tool_calls in explicit-response retry, "
+                                    "continuing to execute tools instead of breaking"
                                 )
                             elif not assistant_msg:
                                 # Still empty (no text and no tool_calls): use fallback
-                                logger.warning(f"[Agent] Still empty after explicit request")
+                                logger.warning("[Agent] Still empty after explicit request")
                                 final_response = self._empty_response_fallback()
                         else:
                             # First-turn empty reply, fall back directly
@@ -951,7 +975,7 @@ class AgentStreamExecutor:
                         
                         # Check for critical error - abort entire conversation
                         if result.get("status") == "critical_error":
-                            logger.error(f"💥 Fatal error detected, aborting conversation")
+                            logger.error("💥 Fatal error detected, aborting conversation")
                             final_response = result.get('result') or _t("任务执行失败", "Task execution failed")
                             return final_response
                         
@@ -1068,7 +1092,7 @@ class AgentStreamExecutor:
                 self._drain_and_close_steering()
                 
                 # Force model to summarize without tool calls
-                logger.info(f"[Agent] Requesting summary from LLM after reaching max steps...")
+                logger.info("[Agent] Requesting summary from LLM after reaching max steps...")
                 
                 # Remember position before injecting the prompt so we can remove it later
                 prompt_insert_idx = len(self.messages)
@@ -1234,7 +1258,25 @@ class AgentStreamExecutor:
         mode: str = "fallback",
         fallback_reason: Optional[str] = None,
     ) -> None:
-        """Expose sanitized MCP retrieval metadata to streaming consumers."""
+        """Expose sanitized MCP retrieval metadata to streaming consumers.
+
+        Fallback (full-injection) is a diagnostic-only condition: it carries no
+        user-actionable information, so it is logged for troubleshooting and
+        NOT surfaced to clients. Only successful ``retrieved`` decisions, which
+        explain why the injected tool set shrank, are emitted to the frontend.
+        """
+        if mode == "fallback":
+            reason = fallback_reason or (
+                decision.fallback_reason
+                if decision is not None
+                else "selection_unavailable"
+            )
+            logger.info(
+                f"[ToolRetrieval] Full injection of {len(mcp_tools)} MCP tool(s) "
+                f"(reason={reason})"
+            )
+            return
+
         if not callable(getattr(self, "_emit_event", None)):
             return
 
@@ -1451,6 +1493,20 @@ class AgentStreamExecutor:
                             "cancelled": True,
                         })
                         raise AgentCancelledError("cancelled during LLM streaming")
+                    steer_inbox = getattr(self, "steer_inbox", None)
+                    if steer_inbox is not None and steer_inbox.has_pending():
+                        logger.info("[Agent] steer detected mid-stream, aborting LLM call")
+                        if full_content:
+                            self.messages.append({
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": full_content}],
+                            })
+                        self._emit_event("message_end", {
+                            "content": full_content,
+                            "tool_calls": [],
+                            "steered": True,
+                        })
+                        return full_content, [], "steered"
 
                 # Check for errors
                 if isinstance(chunk, dict) and chunk.get("error"):
@@ -1468,7 +1524,7 @@ class AgentStreamExecutor:
                     status_code = chunk.get("status_code", "N/A")
                     
                     # Log error with all available information
-                    logger.error(f"🔴 Stream API Error:")
+                    logger.error("🔴 Stream API Error:")
                     logger.error(f"   Message: {error_msg}")
                     logger.error(f"   Status Code: {status_code}")
                     logger.error(f"   Error Code: {error_code}")
@@ -1756,6 +1812,9 @@ class AgentStreamExecutor:
                     "prompt_tokens": int(stream_usage.get("prompt_tokens") or 0),
                     "completion_tokens": int(stream_usage.get("completion_tokens") or 0),
                     "total_tokens": int(stream_usage.get("total_tokens") or 0),
+                    # Server-side prefix cache hits; providers that don't
+                    # report it leave this at 0, which reads as "unknown".
+                    "prompt_cache_hit_tokens": _cache_hit_tokens(stream_usage),
                     # History estimate at capture time (freshness fingerprint).
                     "_est_history": est_history,
                 }
@@ -1768,6 +1827,7 @@ class AgentStreamExecutor:
             if self.agent.last_usage:
                 real_in = self.agent.last_usage.get("prompt_tokens", 0)
                 real_out = self.agent.last_usage.get("completion_tokens", 0)
+                cache_hit = self.agent.last_usage.get("prompt_cache_hit_tokens", 0)
                 # Rough estimate of what we sent this turn (system + tools +
                 # history), the same numbers the usage chart shows.
                 est_sys = self.agent._estimate_text_tokens(self.system_prompt or "")
@@ -1776,8 +1836,10 @@ class AgentStreamExecutor:
                 )
                 est_in = est_sys + est_hist
                 ratio = (est_in / real_in) if real_in else 0
+                hit_ratio = (cache_hit / real_in) if real_in else 0
                 logger.info(
                     f"[Usage] real input={real_in} output={real_out} | "
+                    f"cache_hit={cache_hit} ({hit_ratio:.0%}) | "
                     f"estimate input~={est_in} (sys~={est_sys} hist~={est_hist}) | "
                     f"est/real={ratio:.2f}"
                 )
@@ -1825,6 +1887,10 @@ class AgentStreamExecutor:
 
         # Check for empty response and retry once if enabled
         if retry_on_empty and not full_content and not tool_calls:
+            steer_inbox = getattr(self, "steer_inbox", None)
+            if steer_inbox is not None and steer_inbox.has_pending():
+                logger.info("[Agent] steer pending after stream, skipping empty retry")
+                return full_content, [], "steered"
             logger.warning(f"⚠️  LLM returned empty response (stop_reason: {stop_reason}), retrying once...")
             self._emit_event("message_end", {
                 "content": "",
@@ -2451,6 +2517,29 @@ class AgentStreamExecutor:
 
         return _on_summary_ready
 
+    def _token_budget_trim(self, turns: List[Dict], budget: int) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Walk turns from newest to oldest, accumulating estimated tokens.
+        Keep the longest suffix that fits within the budget.
+
+        Always keeps at least the newest turn (even if it alone exceeds
+        the budget) so the agent never loses the current exchange.
+
+        Returns:
+            (kept_turns, discarded_turns)
+        """
+        kept_turns = []
+        accumulated = 0
+        for turn in reversed(turns):
+            turn_tokens = self._estimate_turn_tokens(turn)
+            if accumulated + turn_tokens > budget and kept_turns:
+                break  # Budget exhausted; keep only what we have
+            kept_turns.append(turn)
+            accumulated += turn_tokens
+        kept_turns.reverse()
+        discarded_turns = turns[:len(turns) - len(kept_turns)]
+        return kept_turns, discarded_turns
+
     def _trim_messages(self):
         """
         智能清理消息历史，保持对话完整性
@@ -2471,35 +2560,8 @@ class AgentStreamExecutor:
         
         if not turns:
             return
-        
-        # Step 2: 轮次限制 - 超出时移除前一半，保留后一半
-        if len(turns) > self.max_context_turns:
-            removed_count = len(turns) // 2
-            keep_count = len(turns) - removed_count
-            
-            discarded_turns = turns[:removed_count]
-            turns = turns[-keep_count:]
 
-            logger.info(
-                f"💾 Context turns exceeded: {keep_count + removed_count} > {self.max_context_turns}, "
-                f"trimmed to {keep_count} turns (removed {removed_count})"
-            )
-
-            # Flush to daily memory + inject context summary (single async LLM call)
-            if self.agent.memory_manager:
-                discarded_messages = []
-                for turn in discarded_turns:
-                    discarded_messages.extend(turn["messages"])
-                if discarded_messages:
-                    user_id = getattr(self.agent, '_current_user_id', None)
-                    cb = self._build_context_summary_callback(discarded_turns, turns)
-                    self.agent.memory_manager.flush_memory(
-                        messages=discarded_messages, user_id=user_id,
-                        reason="trim", max_messages=0,
-                        context_summary_callback=cb,
-                    )
-
-        # Step 3: Token 限制 - 保留完整轮次
+        # Step 2: Calculate the token budget (context window - output reserve - system prompt)
         # Get context window from agent (based on model)
         context_window = self.agent._get_model_context_window()
 
@@ -2519,78 +2581,98 @@ class AgentStreamExecutor:
         else:
             max_tokens = input_ceiling
 
-        # Estimate system prompt tokens
         system_tokens = self.agent._estimate_message_tokens({"role": "system", "content": self.system_prompt})
-        available_tokens = max_tokens - system_tokens
-
-        # Calculate current tokens
+        budget = max_tokens - system_tokens
         current_tokens = sum(self._estimate_turn_tokens(turn) for turn in turns)
-        
-        # If under limit, reconstruct messages and return
-        if current_tokens + system_tokens <= max_tokens:
-            # Reconstruct message list from turns
+
+        # Step 3: Trim to satisfy BOTH constraints (AND):
+        #   1) token budget  — the hard safety limit so the prompt never
+        #      overflows the model context window;
+        #   2) max_context_turns — an explicit cost/latency cap.
+        # History is only kept when it fits within the token budget AND the
+        # turn cap. If both are already satisfied, keep everything untouched
+        # (no trimming, no summary LLM call).
+        if current_tokens + system_tokens <= max_tokens and len(turns) <= self.max_context_turns:
             new_messages = []
             for turn in turns:
                 new_messages.extend(turn['messages'])
-            
+
             old_count = len(self.messages)
             self.messages = new_messages
-            
-            # Log if we removed messages due to turn limit
             if old_count > len(self.messages):
                 logger.info(f"   Rebuilt message list: {old_count} -> {len(self.messages)} messages")
             return
 
-        # Token limit exceeded — tiered strategy based on turn count:
-        #
-        #   Few turns (<5):  Compress ALL turns to text-only (strip tool chains,
-        #                    keep user query + final reply).  Never discard turns
-        #                    — losing even one is too painful when context is thin.
-        #
-        #   Many turns (>=5): Directly discard the first half of turns.
-        #                     With enough turns the oldest ones are less
-        #                     critical, and keeping the recent half intact
-        #                     (with full tool chains) is more useful.
+        # Primary: token-budget-first trim. Walk turns newest -> oldest and keep
+        # the longest suffix that fits the budget (removes only the minimum
+        # turns needed, not a blind "remove half").
+        kept_turns, discarded_turns = self._token_budget_trim(turns, budget)
 
+        if budget <= 0:
+            logger.warning(
+                f"[Agent] System prompt (~{system_tokens} tok) alone exceeds the "
+                f"context budget ({max_tokens} tok); keeping only the previous turn. "
+                f"Shrink the injected workspace files or raise agent_max_context_tokens."
+            )
+
+        # However tight the budget, keep the previous turn beside the current
+        # one, reduced to text: a reply to the last exchange must still make
+        # sense, and context can build back up from there turn by turn. The
+        # current turn is left intact (it may carry images or files).
+        kept_previous = False
+        if len(kept_turns) < 2 and len(turns) > 1:
+            previous = compress_turn_to_text_only(turns[-2])
+            if previous["messages"]:
+                kept_turns = [previous] + kept_turns
+                kept_previous = True
+            discarded_turns = turns[:-2]
+
+        # Secondary: turn-count cap acts as an explicit cost safety net. Even
+        # when the kept turns fit the token budget, never keep more than
+        # max_context_turns of them.
+        if len(kept_turns) > self.max_context_turns:
+            extra = kept_turns[:len(kept_turns) - self.max_context_turns]
+            discarded_turns = extra + discarded_turns
+            kept_turns = kept_turns[-self.max_context_turns:]
+
+        if not discarded_turns and not kept_previous:
+            # Nothing needed discarding (a single oversized newest turn is kept
+            # as-is and handled by the reactive _smart_compact_to_budget path).
+            return
+
+        kept_tokens = sum(self._estimate_turn_tokens(t) for t in kept_turns)
+
+        # Few-turn fallback: when only a handful of turns remain but they still
+        # exceed the token budget, compressing them to plain text is preferable
+        # to discarding — losing even one turn is too painful when context is
+        # already thin. This keeps the user query + final reply of each turn.
         COMPRESS_THRESHOLD = 5
-
-        if len(turns) < COMPRESS_THRESHOLD:
-            # --- Few turns: compress ALL turns to text-only, never discard ---
+        if (not kept_previous and len(kept_turns) < COMPRESS_THRESHOLD
+                and kept_tokens + system_tokens > max_tokens):
             compressed_turns = []
-            for t in turns:
+            for t in kept_turns:
                 compressed = compress_turn_to_text_only(t)
                 if compressed["messages"]:
                     compressed_turns.append(compressed)
 
-            new_messages = []
-            for turn in compressed_turns:
-                new_messages.extend(turn["messages"])
-
+            # Still flush the discarded older turns (if any) to memory below,
+            # then rebuild from the compressed survivors.
             new_tokens = sum(self._estimate_turn_tokens(t) for t in compressed_turns)
-            old_count = len(self.messages)
-            self.messages = new_messages
-
             logger.info(
                 f"📦 Context tokens exceeded (turns<{COMPRESS_THRESHOLD}): "
-                f"~{current_tokens + system_tokens} > {max_tokens}, "
-                f"compressed all {len(turns)} turns to plain text "
-                f"({old_count} -> {len(self.messages)} messages, "
-                f"~{current_tokens + system_tokens} -> ~{new_tokens + system_tokens} tokens)"
+                f"~{kept_tokens + system_tokens} > {max_tokens}, "
+                f"compressed {len(kept_turns)} turns to plain text "
+                f"(~{kept_tokens + system_tokens} -> ~{new_tokens + system_tokens} tokens)"
             )
-            return
-
-        # --- Many turns (>=5): discard the older half, keep the newer half ---
-        removed_count = len(turns) // 2
-        keep_count = len(turns) - removed_count
-        discarded_turns = turns[:removed_count]
-        kept_turns = turns[-keep_count:]
-        kept_tokens = sum(self._estimate_turn_tokens(t) for t in kept_turns)
+            kept_turns = compressed_turns
 
         logger.info(
-            f"🔄 Context tokens exceeded: ~{current_tokens + system_tokens} > {max_tokens}, "
-            f"trimmed to {keep_count} turns (removed {removed_count})"
+            f"💾 Context trim: {len(turns)} turns (~{current_tokens + system_tokens} tok)"
+            f" -> {len(kept_turns)} turns (budget {budget + system_tokens} tok, turn cap {self.max_context_turns})"
         )
 
+        # Flush discarded turns to daily memory + inject context summary
+        # (single async LLM call). Only fires because we truly discarded turns.
         if self.agent.memory_manager:
             discarded_messages = []
             for turn in discarded_turns:
@@ -2604,18 +2686,27 @@ class AgentStreamExecutor:
                     context_summary_callback=cb,
                 )
 
+        # Reconstruct message list from kept turns
         new_messages = []
         for turn in kept_turns:
             new_messages.extend(turn['messages'])
 
-        old_count = len(self.messages)
         self.messages = new_messages
 
-        logger.info(
-            f"   Removed {removed_count} turns "
-            f"({old_count} -> {len(self.messages)} messages, "
-            f"~{current_tokens + system_tokens} -> ~{kept_tokens + system_tokens} tokens)"
-        )
+    def run_start_index(self) -> Optional[int]:
+        """Index in ``self.messages`` where this run's messages begin.
+
+        Trimming rewrites the history before the run and the run then grows it
+        again, so neither the old length nor the last user-text message (steer
+        and hint messages are user text too) marks the start reliably. None when
+        compaction replaced the query itself.
+        """
+        if self.run_user_message is None:
+            return None
+        for idx in range(len(self.messages) - 1, -1, -1):
+            if self.messages[idx] is self.run_user_message:
+                return idx
+        return None
 
     def _prepare_messages(self) -> List[Dict[str, Any]]:
         """

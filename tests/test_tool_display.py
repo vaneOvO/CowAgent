@@ -98,7 +98,8 @@ def test_both_consoles_render_what_the_backend_sends():
     """The web console and the desktop app read the same stream. A field only
     one of them understands is a feature that exists on one client."""
     root = Path(__file__).parents[1]
-    web = (root / "channel/web/static/js/console.js").read_text(encoding="utf-8")
+    from conftest import console_js
+    web = console_js()
     desktop_store = (root / "desktop/src/renderer/src/store/chatStore.ts").read_text(encoding="utf-8")
     desktop_steps = (root / "desktop/src/renderer/src/components/MessageSteps.tsx").read_text(encoding="utf-8")
 

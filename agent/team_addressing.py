@@ -17,23 +17,43 @@ from common.log import logger
 def roster_from_members(host_agent_id: str, members) -> List[dict]:
     """Everyone reachable in a conversation as ``{id, name}``, host first.
 
+    Members arrive as the ids a caller may address an Agent by, so the reserved
+    "default" alias is resolved here too. A member invited by alias is a member:
+    reading it with ``get`` instead would raise on the alias, drop the entry as
+    unknown, and leave an agent the user can see in the conversation
+    unaddressable — with no error to explain why ``@default`` did nothing.
+
     Empty when there is no team (no members): a solo conversation names nobody.
     Unknown/disabled ids are dropped so the roster only holds addressable Agents.
     """
     if not members:
         return []
+    from agent.multiagent import peer as peer_of
     from agent.registry import get_agent_registry
 
     registry = get_agent_registry()
     roster: List[dict] = []
+    seen: set = set()
     for agent_id in [host_agent_id, *members]:
-        if not agent_id or any(item["id"] == agent_id for item in roster):
+        if not agent_id:
             continue
         try:
-            profile = registry.get(agent_id, require_enabled=False)
+            profile = registry.get_addressed(agent_id, require_enabled=False)
+            entry = {"id": profile.id, "name": profile.name or profile.id}
         except Exception:
+            # A teammate that runs elsewhere is still on the team: name it here
+            # so "@name" reaches it like any other. None when nobody knows the
+            # id, which stays dropped as before.
+            found = peer_of(agent_id)
+            if found is None:
+                continue
+            entry = {"id": found.id, "name": found.name or found.id}
+        # Keyed on the resolved id, not the input: an alias and the id it
+        # resolves to are one teammate and must not both reach the roster.
+        if entry["id"] in seen:
             continue
-        roster.append({"id": profile.id, "name": profile.name or profile.id})
+        seen.add(entry["id"])
+        roster.append(entry)
     return roster
 
 

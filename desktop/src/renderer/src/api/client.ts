@@ -5,6 +5,11 @@ import type {
   SkillInfo,
   SkillContent,
   ToolInfo,
+  McpServerConfig,
+  McpServersResult,
+  McpTestResult,
+  SkillMarketSource,
+  SkillPreviewResult,
   MemoryItem,
   MemoryCategory,
   MemoryPage,
@@ -20,6 +25,7 @@ import type {
   SessionsPage,
   SessionSettingsState,
   HistoryPage,
+  UserMessageIndex,
   ContextUsage,
   ModelsData,
   ModelsAction,
@@ -627,12 +633,28 @@ class ApiClient {
     })
   }
 
-  async getHistory(sessionId: string, page = 1, pageSize = 20, agentId?: string): Promise<HistoryPage> {
+  async getHistory(
+    sessionId: string,
+    page = 1,
+    pageSize = 20,
+    agentId?: string,
+    untilSeq?: number
+  ): Promise<HistoryPage> {
+    const until = untilSeq != null ? `&until_seq=${untilSeq}` : ''
     return this.request<{ status: string } & HistoryPage>(
       this.scoped(
-        `/api/history?session_id=${encodeURIComponent(sessionId)}&page=${page}&page_size=${pageSize}`,
+        `/api/history?session_id=${encodeURIComponent(sessionId)}&page=${page}&page_size=${pageSize}${until}`,
         agentId
       )
+    )
+  }
+
+  // Lightweight index of a session's user messages for the navigation timeline.
+  // Returns the whole conversation's user turns at once (no pagination): the
+  // payload is small since it only carries {seq, preview, created_at}.
+  async getUserMessages(sessionId: string, agentId?: string): Promise<UserMessageIndex> {
+    return this.request<{ status: string } & UserMessageIndex>(
+      this.scoped(`/api/history/user_messages?session_id=${encodeURIComponent(sessionId)}`, agentId)
     )
   }
 
@@ -815,6 +837,71 @@ class ApiClient {
     return this.request('/api/skills', {
       method: 'POST',
       body: JSON.stringify({ action, name }),
+    })
+  }
+
+  /** Fetch a skill into a staging area so it can be reviewed before installing. */
+  async previewSkill(source: SkillMarketSource, value: string): Promise<SkillPreviewResult> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'preview', source, value }),
+    })
+  }
+
+  /** Stage uploaded files; `path` keeps each file's place inside a dropped folder. */
+  async uploadSkill(files: Array<{ file: File; path: string }>): Promise<SkillPreviewResult> {
+    const formData = new FormData()
+    for (const { file, path } of files) {
+      formData.append('files', file, file.name)
+      formData.append('paths', path)
+    }
+    return this.postFormData('/api/skills/upload', formData)
+  }
+
+  async confirmSkill(token: string, names: string[]): Promise<ApiResult & { installed?: string[] }> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'confirm', token, names }),
+    })
+  }
+
+  async discardSkill(token: string): Promise<ApiResult> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'discard', token }),
+    })
+  }
+
+  /** Install straight from a remote spec (e.g. an https archive URL), without staging. */
+  async installSkill(spec: string): Promise<ApiResult & { installed?: string[] }> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'install', spec }),
+    })
+  }
+
+  async deleteSkill(name: string): Promise<ApiResult> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'delete', name }),
+    })
+  }
+
+  async getMcpServers(): Promise<McpServersResult> {
+    return this.request('/api/mcp/servers')
+  }
+
+  async saveMcpServers(servers: McpServerConfig[]): Promise<McpServersResult> {
+    return this.request('/api/mcp/servers', {
+      method: 'PUT',
+      body: JSON.stringify({ servers }),
+    })
+  }
+
+  async testMcpServer(server: McpServerConfig): Promise<McpTestResult> {
+    return this.request('/api/mcp/servers/test', {
+      method: 'POST',
+      body: JSON.stringify({ server }),
     })
   }
 

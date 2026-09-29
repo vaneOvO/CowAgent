@@ -413,7 +413,11 @@ def test_missing_goal_is_refused(spawn_tool, enabled):
 
 
 def test_a_task_that_overruns_its_budget_is_reported_not_dropped(parent, workspace, monkeypatch):
-    settings = SubagentSettings(enabled=True, max_depth=1, max_concurrent=2, timeout_seconds=0.2)
+    # A budget generous enough that a loaded CI runner still schedules the
+    # worker thread before it expires: the task never completes on its own
+    # (it waits on the cancel), so the timeout path is exercised regardless of
+    # the exact value — only too-small a budget makes `started` a flaky race.
+    settings = SubagentSettings(enabled=True, max_depth=1, max_concurrent=2, timeout_seconds=2.0)
     started = threading.Event()
 
     class _Hanging:

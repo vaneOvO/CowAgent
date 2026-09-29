@@ -188,29 +188,29 @@ def test_dispatch_stays_read_only():
 # HTTP handlers
 # ----------------------------------------------------------------------
 def _post(handler_cls, body):
-    from channel.web import web_channel
+    from channel.web.api import workspace as workspace_api
 
-    with patch.object(web_channel, "_require_auth"), \
-         patch.object(web_channel.web, "header"), \
-         patch.object(web_channel.web, "data", return_value=json.dumps(body).encode()):
+    with patch.object(workspace_api, "_require_auth"), \
+         patch.object(workspace_api.web, "header"), \
+         patch.object(workspace_api.web, "data", return_value=json.dumps(body).encode()):
         return json.loads(handler_cls().POST())
 
 
 def _get(handler_cls, params):
-    from channel.web import web_channel
+    from channel.web.api import workspace as workspace_api
 
-    with patch.object(web_channel, "_require_auth"), \
-         patch.object(web_channel.web, "header"), \
-         patch.object(web_channel.web, "input", return_value=web_channel.web.storage(**params)):
+    with patch.object(workspace_api, "_require_auth"), \
+         patch.object(workspace_api.web, "header"), \
+         patch.object(workspace_api.web, "input", return_value=workspace_api.web.storage(**params)):
         return json.loads(handler_cls().GET())
 
 
 def test_read_handler_returns_content_and_baseline(tmp_path):
-    from channel.web.web_channel import WorkspaceReadHandler
+    from channel.web.api.workspace import WorkspaceReadHandler
 
     _write(tmp_path / "notes.md", "hello\n")
 
-    with patch("channel.web.web_channel._get_workspace_root", return_value=str(tmp_path)), \
+    with patch("channel.web.api.workspace._get_workspace_root", return_value=str(tmp_path)), \
          patch("common.state_dir.state_root_str", return_value=str(tmp_path)):
         response = _get(WorkspaceReadHandler, {"path": "notes.md", "session": "s1", "agent": ""})
 
@@ -221,11 +221,11 @@ def test_read_handler_returns_content_and_baseline(tmp_path):
 
 
 def test_write_handler_saves_file(tmp_path):
-    from channel.web.web_channel import WorkspaceWriteHandler
+    from channel.web.api.workspace import WorkspaceWriteHandler
 
     target = _write(tmp_path / "notes.md", "hello\n")
 
-    with patch("channel.web.web_channel._get_workspace_root", return_value=str(tmp_path)), \
+    with patch("channel.web.api.workspace._get_workspace_root", return_value=str(tmp_path)), \
          patch("common.state_dir.state_root_str", return_value=str(tmp_path)):
         response = _post(WorkspaceWriteHandler, {
             "path": str(target),
@@ -239,11 +239,11 @@ def test_write_handler_saves_file(tmp_path):
 
 
 def test_write_handler_reports_conflict_code(tmp_path):
-    from channel.web.web_channel import WorkspaceWriteHandler
+    from channel.web.api.workspace import WorkspaceWriteHandler
 
     target = _write(tmp_path / "notes.md", "hello\n")
 
-    with patch("channel.web.web_channel._get_workspace_root", return_value=str(tmp_path)), \
+    with patch("channel.web.api.workspace._get_workspace_root", return_value=str(tmp_path)), \
          patch("common.state_dir.state_root_str", return_value=str(tmp_path)):
         response = _post(WorkspaceWriteHandler, {
             "path": "notes.md",
@@ -257,9 +257,9 @@ def test_write_handler_reports_conflict_code(tmp_path):
 
 
 def test_write_handler_rejects_non_string_content(tmp_path):
-    from channel.web.web_channel import WorkspaceWriteHandler
+    from channel.web.api.workspace import WorkspaceWriteHandler
 
-    with patch("channel.web.web_channel._get_workspace_root", return_value=str(tmp_path)):
+    with patch("channel.web.api.workspace._get_workspace_root", return_value=str(tmp_path)):
         response = _post(WorkspaceWriteHandler, {"path": "notes.md", "content": None})
 
     assert response["status"] == "error"
@@ -267,14 +267,14 @@ def test_write_handler_rejects_non_string_content(tmp_path):
 
 
 def test_write_handler_rejects_path_outside_workspace(tmp_path):
-    from channel.web.web_channel import WorkspaceWriteHandler
+    from channel.web.api.workspace import WorkspaceWriteHandler
 
     project = tmp_path / "project"
     project.mkdir()
     outside = tmp_path / "elsewhere.md"
     _write(outside, "secret\n")
 
-    with patch("channel.web.web_channel._get_workspace_root", return_value=str(project)), \
+    with patch("channel.web.api.workspace._get_workspace_root", return_value=str(project)), \
          patch("common.state_dir.state_root_str", return_value=str(project)):
         response = _post(WorkspaceWriteHandler, {
             "path": str(outside),
@@ -287,7 +287,7 @@ def test_write_handler_rejects_path_outside_workspace(tmp_path):
 
 def test_write_handler_falls_back_to_state_root_for_system_assets(tmp_path):
     """Memory files stay in the state root even while a project is open."""
-    from channel.web.web_channel import WorkspaceWriteHandler
+    from channel.web.api.workspace import WorkspaceWriteHandler
 
     state_root = tmp_path / "cow"
     (state_root / "memory").mkdir(parents=True)
@@ -295,7 +295,7 @@ def test_write_handler_falls_back_to_state_root_for_system_assets(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
 
-    with patch("channel.web.web_channel._get_workspace_root", return_value=str(project)), \
+    with patch("channel.web.api.workspace._get_workspace_root", return_value=str(project)), \
          patch("common.state_dir.state_root_str", return_value=str(state_root)):
         response = _post(WorkspaceWriteHandler, {
             "path": "memory/MEMORY.md",
@@ -312,10 +312,13 @@ def test_write_handler_falls_back_to_state_root_for_system_assets(tmp_path):
 # ----------------------------------------------------------------------
 def test_web_console_editor_contract():
     root = Path(__file__).parents[1]
-    html = (root / "channel/web/chat.html").read_text(encoding="utf-8")
+    # The page is assembled from templates/, so assert against what is served.
+    from channel.web.core import template
+    html = template.render("chat.html")
     js = (root / "channel/web/static/js/workspace.js").read_text(encoding="utf-8")
-    css = (root / "channel/web/static/css/console.css").read_text(encoding="utf-8")
-    console = (root / "channel/web/static/js/console.js").read_text(encoding="utf-8")
+    css = (root / "channel/web/static/css/workspace.css").read_text(encoding="utf-8")
+    from conftest import console_js
+    console = console_js()
 
     assert 'id="ws-btn-edit"' in html
     assert 'id="ws-btn-save"' in html

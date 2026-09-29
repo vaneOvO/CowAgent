@@ -25,7 +25,7 @@ MiniMax 支持文本对话、图像理解、图像生成与语音合成，一份
 
 ## 图像理解
 
-MiniMax 的 M2.x 系列 chat 模型本身不支持视觉，视觉调用统一路由到 `MiniMax-Text-01`。配置 `minimax_api_key` 后 Agent 的 Vision 工具会自动使用该模型，无需在配置文件中显式指定。
+MiniMax-M3 通过 OpenAI 兼容的 chat 接口原生支持文本、图像与视频输入。配置 `minimax_api_key` 后 Agent 的 Vision 工具会自动将图像请求路由到 MiniMax-M3，无需单独指定视觉模型。
 
 ## 图像生成
 

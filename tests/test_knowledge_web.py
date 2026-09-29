@@ -4,16 +4,16 @@ from unittest.mock import patch
 
 
 def test_knowledge_action_handler_delegates_to_dispatch(tmp_path):
-    from channel.web.web_channel import KnowledgeActionHandler
+    from channel.web.api.knowledge import KnowledgeActionHandler
 
     request = {"action": "create_category", "payload": {"path": "research"}}
     dispatched = {"action": "create_category", "code": 200, "message": "success",
                   "payload": {"path": "research", "created": True}}
 
-    with patch("channel.web.web_channel._require_auth"), \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel.web.data", return_value=json.dumps(request).encode()), \
-         patch("channel.web.web_channel._get_workspace_root", return_value=str(tmp_path)), \
+    with patch("channel.web.api.knowledge._require_auth"), \
+         patch("channel.web.api.knowledge.web.header"), \
+         patch("channel.web.api.knowledge.web.data", return_value=json.dumps(request).encode()), \
+         patch("channel.web.api.knowledge._get_workspace_root", return_value=str(tmp_path)), \
          patch("agent.knowledge.service.KnowledgeService.dispatch", return_value=dispatched) as dispatch:
         response = json.loads(KnowledgeActionHandler().POST())
 
@@ -23,16 +23,16 @@ def test_knowledge_action_handler_delegates_to_dispatch(tmp_path):
 
 
 def test_knowledge_action_handler_preserves_dispatch_error(tmp_path):
-    from channel.web.web_channel import KnowledgeActionHandler
+    from channel.web.api.knowledge import KnowledgeActionHandler
 
     dispatched = {"action": "delete_documents", "code": 403,
                   "message": "protected knowledge file: index.md", "payload": None}
     request = {"action": "delete_documents", "payload": {"paths": ["index.md"]}}
 
-    with patch("channel.web.web_channel._require_auth"), \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel.web.data", return_value=json.dumps(request).encode()), \
-         patch("channel.web.web_channel._get_workspace_root", return_value=str(tmp_path)), \
+    with patch("channel.web.api.knowledge._require_auth"), \
+         patch("channel.web.api.knowledge.web.header"), \
+         patch("channel.web.api.knowledge.web.data", return_value=json.dumps(request).encode()), \
+         patch("channel.web.api.knowledge._get_workspace_root", return_value=str(tmp_path)), \
          patch("agent.knowledge.service.KnowledgeService.dispatch", return_value=dispatched):
         response = json.loads(KnowledgeActionHandler().POST())
 
@@ -43,8 +43,11 @@ def test_knowledge_action_handler_preserves_dispatch_error(tmp_path):
 
 def test_knowledge_frontend_management_contract():
     root = Path(__file__).parents[1]
-    html = (root / "channel/web/chat.html").read_text(encoding="utf-8")
-    js = (root / "channel/web/static/js/console.js").read_text(encoding="utf-8")
+    # The page is assembled from templates/, so assert against what is served.
+    from channel.web.core import template
+    html = template.render("chat.html")
+    from conftest import console_js
+    js = console_js()
 
     assert 'id="knowledge-dialog-overlay"' in html
     assert 'id="knowledge-dialog-textarea"' in html
@@ -84,7 +87,7 @@ class UploadedFile:
 
 
 def test_knowledge_import_handler_delegates_to_dispatch(tmp_path):
-    from channel.web.web_channel import KnowledgeImportHandler
+    from channel.web.api.knowledge import KnowledgeImportHandler
 
     dispatched = {"action": "import_documents", "code": 200, "message": "success",
                   "payload": {"imported": 2, "skipped": 0, "failed": 0}}
@@ -94,10 +97,10 @@ def test_knowledge_import_handler_delegates_to_dispatch(tmp_path):
         "files": [UploadedFile("a.md", b"# A"), UploadedFile("b.txt", b"B")],
     }
 
-    with patch("channel.web.web_channel._require_auth"), \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel._raw_web_input", return_value=params), \
-         patch("channel.web.web_channel._get_workspace_root", return_value=str(tmp_path)), \
+    with patch("channel.web.api.knowledge._require_auth"), \
+         patch("channel.web.api.knowledge.web.header"), \
+         patch("channel.web.api.knowledge._raw_web_input", return_value=params), \
+         patch("channel.web.api.knowledge._get_workspace_root", return_value=str(tmp_path)), \
          patch("agent.knowledge.service.KnowledgeService.dispatch", return_value=dispatched) as dispatch:
         response = json.loads(KnowledgeImportHandler().POST())
 
@@ -112,13 +115,13 @@ def test_knowledge_import_handler_delegates_to_dispatch(tmp_path):
 
 
 def test_knowledge_import_handler_rejects_large_content_length(tmp_path):
-    from channel.web.web_channel import KnowledgeImportHandler
+    from channel.web.api.knowledge import KnowledgeImportHandler
     from agent.knowledge.service import KnowledgeService
     assert KnowledgeService.MAX_IMPORT_TOTAL_SIZE == 200 * 1024 * 1024
 
-    with patch("channel.web.web_channel._require_auth"), \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel.web.ctx") as ctx:
+    with patch("channel.web.api.knowledge._require_auth"), \
+         patch("channel.web.api.knowledge.web.header"), \
+         patch("channel.web.api.knowledge.web.ctx") as ctx:
         ctx.env = {"CONTENT_LENGTH": str(KnowledgeService.MAX_IMPORT_TOTAL_SIZE + 1)}
         response = json.loads(KnowledgeImportHandler().POST())
 

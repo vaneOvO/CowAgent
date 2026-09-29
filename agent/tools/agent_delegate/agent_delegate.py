@@ -18,6 +18,38 @@ from common.log import logger
 TASK_SOURCE = "delegation"
 
 
+def delegated_prompt(source_name: str, source_id: str, task: str) -> str:
+    """What the teammate is actually asked. Shared with the path that serves
+    a hand-off arriving from another process, so both read identically."""
+    return (
+        f"Delegated by Agent '{source_name}' ({source_id}).\n\n"
+        f"Task:\n{task}\n\n"
+        "Return a concise result to the delegating Agent. Do not address the user directly."
+    )
+
+
+def delegated_result_text(reply) -> str:
+    """The teammate's answer as text for the delegating Agent.
+
+    A teammate that sent files comes back as a file reply whose ``content``
+    is the first file's URL; its prose rides in ``text_content``. Returning
+    ``content`` alone would hand back a bare link and drop the answer.
+    """
+    if reply is None:
+        return ""
+    if reply.type not in (ReplyType.IMAGE_URL, ReplyType.FILE):
+        return reply.content or ""
+    parts = [getattr(reply, "text_content", "") or ""]
+    for r in [reply] + list(getattr(reply, "extra_replies", None) or []):
+        url = str(r.content or "")
+        if not url:
+            continue
+        # Only a published image renders inline; a local path stays as it was.
+        is_web = url.lower().startswith(("http://", "https://"))
+        parts.append(f"![]({url})" if r.type == ReplyType.IMAGE_URL and is_web else url)
+    return "\n\n".join(p for p in parts if p)
+
+
 def format_delegate_result(
     source_name: str,
     target_name: str,
@@ -50,51 +82,80 @@ class _DelegateView:
     The delegating Agent's context is unaffected: it still receives only the
     teammate's returned result, which is the whole point. This is the other
     audience — the person watching — for whom a teammate that reports nothing
-    until it finishes is indistinguishable from one that hung. So the
-    teammate's tool calls are relayed under this call's card, the same way a
-    sub agent's are, while its prose and reasoning are dropped (those render as
-    the assistant speaking, and a teammate muttering into the main reply reads
-    as the Agent losing the thread).
+    until it finishes is indistinguishable from one that hung.
+
+    So the teammate's turn is relayed as its own turn: the events are passed
+    through untouched, bracketed by a start/end pair naming who is speaking.
+    A client that understands the pair attributes them to the teammate and
+    renders them exactly as it renders any other reply; one that does not
+    still has the delegation result on the call's card, as before. Without
+    that attribution the prose would read as the delegating Agent suddenly
+    talking about someone else's work, which is why it used to be dropped.
     """
 
-    def __init__(self, tool, card_id: str):
+    #: A teammate's turn looks like any other: prose, reasoning, tool calls.
+    RELAYED = (
+        "message_update",
+        "reasoning_update",
+        "tool_execution_start",
+        "tool_execution_progress",
+        "tool_execution_end",
+    )
+
+    #: Emitted around a relayed turn to say who it belongs to.
+    START = "peer_message_start"
+    END = "peer_message_end"
+
+    def __init__(self, tool, card_id: str, source, target_id: str, target_name: str):
         self.tool = tool
         self.card_id = card_id
+        self.source_id = getattr(source, "id", "") or ""
+        self.source_name = getattr(source, "name", "") or self.source_id
+        self.target_id = target_id
+        self.target_name = target_name or target_id
+        self._open = False
 
     def relay(self, event: dict) -> None:
         if not isinstance(event, dict):
             return
         event_type = event.get("type")
         data = event.get("data") or {}
-        if event_type == "tool_execution_start":
-            self.tool.emit_event(
-                "subagent_step",
-                {
-                    "card_id": self.card_id,
-                    "step_id": self._step_id(data),
-                    "phase": "start",
-                    "tool_name": data.get("tool_name", "tool"),
-                    "arguments": data.get("arguments") or {},
-                },
-            )
-        elif event_type == "tool_execution_end":
-            status = data.get("status", "success")
-            step = {
+        # A teammate handing work onward is still just another turn: pass its
+        # markers up untouched so the chain reads as a flat sequence of turns
+        # rather than turns nested inside turns.
+        if event_type in (self.START, self.END):
+            self.tool.emit_event(event_type, data)
+            return
+        if event_type not in self.RELAYED:
+            return
+        self.open()
+        self.tool.emit_event(event_type, data)
+
+    def open(self) -> None:
+        """Announce the teammate's turn, once, when it first has something to say."""
+        if self._open:
+            return
+        self._open = True
+        self.tool.emit_event(
+            self.START,
+            {
                 "card_id": self.card_id,
-                "step_id": self._step_id(data),
-                "phase": "end",
-                "tool_name": data.get("tool_name", "tool"),
-                "status": status,
-                "execution_time": round(data.get("execution_time") or 0, 2),
-            }
-            if status != "success":
-                from agent.tools.subagent.subagent import _error_text
+                "agent_id": self.target_id,
+                "agent_name": self.target_name,
+                "source_id": self.source_id,
+                "source_name": self.source_name,
+            },
+        )
 
-                step["error"] = _error_text(data.get("result"))
-            self.tool.emit_event("subagent_step", step)
-
-    def _step_id(self, data: dict) -> str:
-        return f"{self.card_id}:{data.get('tool_call_id') or uuid.uuid4().hex[:8]}"
+    def close(self, status: str = "done") -> None:
+        """End the teammate's turn, so what follows is the caller speaking again."""
+        if not self._open:
+            return
+        self._open = False
+        self.tool.emit_event(
+            self.END,
+            {"card_id": self.card_id, "agent_id": self.target_id, "status": status},
+        )
 
 
 @dataclass(frozen=True)
@@ -277,13 +338,16 @@ class AgentDelegateTool(BaseTool):
                 continue
             if policy is not None and not policy.allows(source_agent_id, member_id):
                 continue
-            try:
-                profile = self.agent_bridge.agent_registry.get(member_id)
-            except (KeyError, ValueError):
+            # A teammate may be hosted in another process; the roster lists it
+            # the same way, and the hand-off itself picks the route later.
+            from agent.multiagent import resolve_teammate
+
+            entry = resolve_teammate(member_id, self.agent_bridge.agent_registry)
+            if entry is None:
                 continue
-            if any(item["id"] == profile.id for item in roster):
+            if any(item["id"] == entry["id"] for item in roster):
                 continue
-            roster.append({"id": profile.id, "name": profile.name})
+            roster.append({"id": entry["id"], "name": entry["name"]})
         return roster
 
     def _policy_safe(self) -> Optional[DelegationPolicy]:
@@ -357,10 +421,20 @@ class AgentDelegateTool(BaseTool):
                 f"'{target_agent_id}' is not a teammate you can delegate to in this "
                 f"conversation. {self._roster_hint(roster)}"
             )
+        # The teammate is either an Agent of this process or one reached over
+        # the installed transport. Everything up to the actual run treats the
+        # two alike, so the guards below apply to both.
+        from agent.multiagent import get_transport, peer as peer_of
+
+        target = None
+        peer_target = None
         try:
             target = self.agent_bridge.agent_registry.get(target_agent_id)
         except (KeyError, ValueError):
-            return ToolResult.fail(f"Target Agent '{target_agent_id}' is not available")
+            peer_target = peer_of(target_agent_id)
+            if peer_target is None or get_transport() is None:
+                return ToolResult.fail(f"Target Agent '{target_agent_id}' is not available")
+        target_id = target.id if target is not None else peer_target.id
 
         raw_trace = context_values.get("delegation_trace") or (source.id,)
         if not isinstance(raw_trace, (list, tuple)) or not all(
@@ -370,13 +444,13 @@ class AgentDelegateTool(BaseTool):
         trace = tuple(raw_trace)
         if not trace or trace[-1] != source.id:
             return ToolResult.fail("Delegation trace does not match the source Agent")
-        if target.id in trace:
+        if target_id in trace:
             return ToolResult.fail(
-                f"Delegation cycle rejected: {' -> '.join((*trace, target.id))}"
+                f"Delegation cycle rejected: {' -> '.join((*trace, target_id))}"
             )
-        if not policy.allows(source.id, target.id):
+        if not policy.allows(source.id, target_id):
             return ToolResult.fail(
-                f"Agent '{source.id}' is not allowed to delegate to '{target.id}'"
+                f"Agent '{source.id}' is not allowed to delegate to '{target_id}'"
             )
 
         depth = int(context_values.get("delegation_depth", len(trace) - 1)) + 1
@@ -390,8 +464,11 @@ class AgentDelegateTool(BaseTool):
             or context_values.get("session_id")
             or uuid.uuid4()
         )
-        session_id = self._session_id(source.id, target.id, root_session_id)
-        request_id = f"delegate_{uuid.uuid4().hex}"
+        # The team the teammate may hand work onward to: this conversation's
+        # roster plus whatever rode down the chain, minus those already in it.
+        team_ids = {source.id, *(item["id"] for item in roster)}
+        team_ids |= set(context_values.get("delegation_members") or [])
+        onward_members = sorted(team_ids - set(trace))
 
         # The run id is minted here and carried by value: the target may run
         # under a different ambient run id, but linking the child to this parent
@@ -400,6 +477,26 @@ class AgentDelegateTool(BaseTool):
 
         run_id = uuid.uuid4().hex
         parent_run_id = current_agent_run_id() or ""
+
+        # Relay the teammate's turn as it happens so a watcher can follow the
+        # delegated work live. The card is this tool call, since one delegation
+        # is one card.
+        card_id = getattr(self, "tool_call_id", None) or run_id
+        speaker = target if target is not None else peer_target
+        view = _DelegateView(
+            self, card_id, source,
+            getattr(speaker, "id", "") or "",
+            getattr(speaker, "name", "") or "",
+        )
+
+        if target is None:
+            return self._delegate_peer(
+                source, peer_target, task, policy, trace, depth,
+                root_session_id, onward_members, view, run_id,
+            )
+
+        session_id = self._session_id(source.id, target.id, root_session_id)
+        request_id = f"delegate_{uuid.uuid4().hex}"
 
         delegated_context = Context(ContextType.TEXT, task, kwargs={})
         delegated_context["session_id"] = session_id
@@ -419,24 +516,12 @@ class AgentDelegateTool(BaseTool):
         # could reach it; the cycle guard, not the roster, stops loops. The
         # source drops whoever is already in the chain to prompt only reachable
         # options.
-        team_ids = {source.id, *(item["id"] for item in roster)}
-        team_ids |= set(context_values.get("delegation_members") or [])
-        delegated_context["delegation_members"] = sorted(team_ids - set(trace))
+        delegated_context["delegation_members"] = onward_members
         delegated_context["run_id"] = run_id
         delegated_context["parent_run_id"] = parent_run_id
         delegated_context["task_source"] = TASK_SOURCE
 
-        prompt = (
-            f"Delegated by Agent '{source.name}' ({source.id}).\n\n"
-            f"Task:\n{task}\n\n"
-            "Return a concise result to the delegating Agent. Do not address the user directly."
-        )
-
-        # Relay the teammate's tool steps under this call's card so a watcher
-        # can follow the delegated work live, exactly like a sub agent. The
-        # card is this tool call, since one delegation is one card.
-        card_id = getattr(self, "tool_call_id", None) or run_id
-        view = _DelegateView(self, card_id)
+        prompt = delegated_prompt(source.name, source.id, task)
 
         # Serialize hands-off to the same target session, then run it inline:
         # the caller waits for the teammate's answer and returns it directly.
@@ -463,6 +548,8 @@ class AgentDelegateTool(BaseTool):
                 f"Delegation to '{target.id}' failed: {exc}", display=display
             )
         finally:
+            # Whatever happened, the teammate is done speaking.
+            view.close()
             lock.release()
         duration = time.monotonic() - started_at
 
@@ -474,7 +561,7 @@ class AgentDelegateTool(BaseTool):
             return ToolResult.fail(
                 f"Delegation to '{target.id}' failed: {reply.content}", display=display
             )
-        content = reply.content if reply is not None else ""
+        content = delegated_result_text(reply)
         display = format_delegate_result(
             source.name, target.name, content, status="done", duration_seconds=duration,
         )
@@ -488,6 +575,75 @@ class AgentDelegateTool(BaseTool):
                 "session_id": session_id,
                 "status": "done",
                 "content": content,
+            },
+            display=display,
+        )
+
+    def _delegate_peer(
+        self, source, target, task: str, policy: DelegationPolicy, trace: tuple,
+        depth: int, root_session_id: str, onward_members: list,
+        view: "_DelegateView", run_id: str,
+    ) -> ToolResult:
+        """Hand the task to a teammate hosted in another process.
+
+        Same guards, same card, same result shape as a local hand-off; only
+        the run happens elsewhere. The teammate is sent the whole team as
+        profiles so it can name them on its own roster and hand work onward.
+        """
+        from agent.multiagent import InvokeRequest, PeerAgent, get_transport, resolve_teammate
+
+        transport = get_transport()
+        if transport is None:
+            return ToolResult.fail(f"Target Agent '{target.id}' is not available")
+
+        peers = []
+        for member_id in onward_members:
+            entry = resolve_teammate(member_id, self.agent_bridge.agent_registry)
+            if entry is not None:
+                peers.append(PeerAgent.from_any(entry))
+        request = InvokeRequest(
+            request_id=f"delegate_{uuid.uuid4().hex}",
+            target_id=target.id,
+            task=task,
+            source_id=source.id,
+            source_name=source.name,
+            root_session_id=root_session_id,
+            trace=(*trace, target.id),
+            depth=depth,
+            members=tuple(onward_members),
+            peers=tuple(p for p in peers if p is not None),
+            timeout_seconds=policy.timeout_seconds,
+        )
+        started_at = time.monotonic()
+        try:
+            result = transport.invoke(request, on_event=view.relay)
+        except Exception as exc:
+            display = format_delegate_result(source.name, target.name, str(exc), status="failed")
+            return ToolResult.fail(f"Delegation to '{target.id}' failed: {exc}", display=display)
+        finally:
+            # Whatever happened, the teammate is done speaking.
+            view.close()
+        duration = result.duration_seconds or (time.monotonic() - started_at)
+
+        if not result.ok:
+            display = format_delegate_result(
+                source.name, target.name, result.error, status="failed", duration_seconds=duration,
+            )
+            return ToolResult.fail(
+                f"Delegation to '{target.id}' failed: {result.error}", display=display
+            )
+        display = format_delegate_result(
+            source.name, target.name, result.content, status="done", duration_seconds=duration,
+        )
+        return ToolResult.success(
+            {
+                "run_id": run_id,
+                "agent_id": target.id,
+                "agent_name": result.agent_name or target.name,
+                "delegated_by": source.id,
+                "depth": depth,
+                "status": "done",
+                "content": result.content,
             },
             display=display,
         )

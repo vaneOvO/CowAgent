@@ -368,10 +368,10 @@ class TestQianfanSurfaces(unittest.TestCase):
     def test_web_console_registers_qianfan_provider(self):
         # Assert against the registry itself rather than the source text, so
         # reformatting or switching the label to an i18n dict cannot break this.
-        from channel.web.web_channel import ConfigHandler
+        from channel.web.core import providers
         from common import const
 
-        provider = ConfigHandler.PROVIDER_MODELS["qianfan"]
+        provider = providers.PROVIDER_MODELS["qianfan"]
 
         self.assertEqual(provider["api_key_field"], "qianfan_api_key")
         self.assertEqual(provider["api_base_key"], "qianfan_api_base")
@@ -379,7 +379,8 @@ class TestQianfanSurfaces(unittest.TestCase):
         self.assertIn(const.ERNIE_5_1, provider["models"])
 
     def test_web_console_allows_qianfan_config_edits(self):
-        source = self._read("channel/web/web_channel.py")
+        from conftest import web_backend_py
+        source = web_backend_py()
 
         self.assertIn('"qianfan_api_base"', source)
         self.assertIn('"qianfan_api_key"', source)

@@ -29,9 +29,9 @@ if "web" not in sys.modules:
     )
     sys.modules["web"] = web_stub
 
-from channel.web import web_channel
+from channel.web.api import scheduler as scheduler_api
 
-SchedulerUpdateHandler = web_channel.SchedulerUpdateHandler
+SchedulerUpdateHandler = scheduler_api.SchedulerUpdateHandler
 
 
 def _store_task(tmp_path, action):
@@ -50,22 +50,22 @@ def _store_task(tmp_path, action):
 
 
 def _post_update(store, payload):
-    with patch("channel.web.web_channel._require_auth"), \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel.web.data", return_value=json.dumps(payload).encode()), \
-         patch("channel.web.web_channel._global_task_store", return_value=store):
+    with patch("channel.web.api.scheduler._require_auth"), \
+         patch("channel.web.api.scheduler.web.header"), \
+         patch("channel.web.api.scheduler.web.data", return_value=json.dumps(payload).encode()), \
+         patch("channel.web.api.scheduler._global_task_store", return_value=store):
         return json.loads(SchedulerUpdateHandler().POST())
 
 
 def test_web_manual_run_is_authenticated_and_delegates_to_scheduler():
-    assert hasattr(web_channel, "SchedulerRunHandler")
+    assert hasattr(scheduler_api, "SchedulerRunHandler")
 
     service = Mock()
-    with patch("channel.web.web_channel._require_auth") as require_auth, \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel.web.data", return_value=b'{"task_id":"task-1"}'), \
+    with patch("channel.web.api.scheduler._require_auth") as require_auth, \
+         patch("channel.web.api.scheduler.web.header"), \
+         patch("channel.web.api.scheduler.web.data", return_value=b'{"task_id":"task-1"}'), \
          patch("agent.tools.scheduler.integration.get_scheduler_service", return_value=service):
-        response = json.loads(web_channel.SchedulerRunHandler().POST())
+        response = json.loads(scheduler_api.SchedulerRunHandler().POST())
 
     require_auth.assert_called_once_with()
     service.run_task_now.assert_called_once_with("task-1")
@@ -76,13 +76,13 @@ def test_web_manual_run_is_authenticated_and_delegates_to_scheduler():
 
 
 def test_web_manual_run_rejects_unavailable_scheduler():
-    assert hasattr(web_channel, "SchedulerRunHandler")
+    assert hasattr(scheduler_api, "SchedulerRunHandler")
 
-    with patch("channel.web.web_channel._require_auth"), \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel.web.data", return_value=b'{"task_id":"task-1"}'), \
+    with patch("channel.web.api.scheduler._require_auth"), \
+         patch("channel.web.api.scheduler.web.header"), \
+         patch("channel.web.api.scheduler.web.data", return_value=b'{"task_id":"task-1"}'), \
          patch("agent.tools.scheduler.integration.get_scheduler_service", return_value=None):
-        response = json.loads(web_channel.SchedulerRunHandler().POST())
+        response = json.loads(scheduler_api.SchedulerRunHandler().POST())
 
     assert response == {
         "status": "error",
@@ -92,8 +92,9 @@ def test_web_manual_run_rejects_unavailable_scheduler():
 
 def test_manual_run_is_exposed_by_explicit_web_and_desktop_controls():
     root = Path(__file__).parents[1]
-    web_source = (root / "channel/web/web_channel.py").read_text(encoding="utf-8")
-    web_console = (root / "channel/web/static/js/console.js").read_text(encoding="utf-8")
+    from conftest import console_js, web_backend_py
+    web_source = web_backend_py()
+    web_console = console_js()
     desktop_client = (root / "desktop/src/renderer/src/api/client.ts").read_text(encoding="utf-8")
     desktop_page = (root / "desktop/src/renderer/src/pages/TasksPage.tsx").read_text(encoding="utf-8")
 
@@ -191,11 +192,11 @@ def test_list_aggregates_every_agent_and_tags_the_owner(tmp_path):
     carries the ``agent_id`` stored on the row, not implied by a file path."""
     store = _seed_global_tasks(tmp_path, [("p-task", "primary"), ("r-task", "research")])
 
-    with patch("channel.web.web_channel._require_auth"), \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel.web.input", return_value=types.SimpleNamespace(agent_id="")), \
-         patch("channel.web.web_channel._global_task_store", return_value=store):
-        response = json.loads(web_channel.SchedulerHandler().GET())
+    with patch("channel.web.api.scheduler._require_auth"), \
+         patch("channel.web.api.scheduler.web.header"), \
+         patch("channel.web.api.scheduler.web.input", return_value=types.SimpleNamespace(agent_id="")), \
+         patch("channel.web.api.scheduler._global_task_store", return_value=store):
+        response = json.loads(scheduler_api.SchedulerHandler().GET())
 
     assert response["status"] == "success"
     owners = {task["id"]: task["agent_id"] for task in response["tasks"]}
@@ -205,12 +206,12 @@ def test_list_aggregates_every_agent_and_tags_the_owner(tmp_path):
 def test_list_scopes_to_a_single_agent_when_asked(tmp_path):
     store = _seed_global_tasks(tmp_path, [("p-task", "primary"), ("r-task", "research")])
 
-    with patch("channel.web.web_channel._require_auth"), \
-         patch("channel.web.web_channel.web.header"), \
-         patch("channel.web.web_channel.web.input", return_value=types.SimpleNamespace(agent_id="research")), \
-         patch("channel.web.web_channel._request_agent_id", return_value="research"), \
-         patch("channel.web.web_channel._global_task_store", return_value=store):
-        response = json.loads(web_channel.SchedulerHandler().GET())
+    with patch("channel.web.api.scheduler._require_auth"), \
+         patch("channel.web.api.scheduler.web.header"), \
+         patch("channel.web.api.scheduler.web.input", return_value=types.SimpleNamespace(agent_id="research")), \
+         patch("channel.web.api.scheduler._request_agent_id", return_value="research"), \
+         patch("channel.web.api.scheduler._global_task_store", return_value=store):
+        response = json.loads(scheduler_api.SchedulerHandler().GET())
 
     assert response["status"] == "success"
     assert [task["id"] for task in response["tasks"]] == ["r-task"]

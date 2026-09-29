@@ -42,15 +42,15 @@ if "web" not in sys.modules:
 
 def _providers_with(config, catalog_map=None, hidden_map=None):
     """Provider overview rows, as the models API returns them."""
-    from channel.web import web_channel
+    from channel.web.api import models as models_api
 
-    with patch.object(web_channel, "conf", return_value=config), \
+    with patch.object(models_api, "conf", return_value=config), \
             patch("models.custom_provider.conf", return_value=config), \
-            patch("channel.web.web_channel.model_catalog.get_catalog_map",
+            patch("channel.web.api.models.model_catalog.get_catalog_map",
                   return_value=catalog_map or {}), \
-            patch("channel.web.web_channel.model_catalog.get_hidden_map",
+            patch("channel.web.api.models.model_catalog.get_hidden_map",
                   return_value=hidden_map or {}):
-        return web_channel.ModelsHandler._provider_overview()
+        return models_api.ModelsHandler._provider_overview()
 
 
 def _provider(config, pid, catalog_map=None, hidden_map=None):
@@ -149,23 +149,23 @@ class TestApplyCatalogFiltersByCapability(unittest.TestCase):
     """The chat dropdown only offers text-tagged models from the overlay."""
 
     def test_no_overlay_keeps_the_preset_dropdown(self):
-        from channel.web import web_channel
+        from channel.web.api import models as models_api
 
         presets = {"zhipu": [{"value": "glm-5.2"}]}
-        with patch("channel.web.web_channel.model_catalog.get_catalog_map", return_value={}), \
-                patch("channel.web.web_channel.model_catalog.get_hidden_map", return_value={}):
-            out = web_channel.ModelsHandler._apply_catalog(presets, "text")
+        with patch("channel.web.api.models.model_catalog.get_catalog_map", return_value={}), \
+                patch("channel.web.api.models.model_catalog.get_hidden_map", return_value={}):
+            out = models_api.ModelsHandler._apply_catalog(presets, "text")
         self.assertEqual(out["zhipu"], [{"value": "glm-5.2"}])
 
     def test_overlay_narrows_to_text_tagged_effective_models(self):
-        from channel.web import web_channel
+        from channel.web.api import models as models_api
 
         override = [{"name": "chat-only", "capabilities": ["text"]},
                     {"name": "vec", "capabilities": ["embedding"]}]
-        with patch("channel.web.web_channel.model_catalog.get_catalog_map",
+        with patch("channel.web.api.models.model_catalog.get_catalog_map",
                    return_value={"zhipu": override}), \
-                patch("channel.web.web_channel.model_catalog.get_hidden_map", return_value={}):
-            out = web_channel.ModelsHandler._apply_catalog({}, "text")
+                patch("channel.web.api.models.model_catalog.get_hidden_map", return_value={}):
+            out = models_api.ModelsHandler._apply_catalog({}, "text")
         names = [m["value"] for m in out["zhipu"]]
         self.assertIn("chat-only", names)
         self.assertNotIn("vec", names, "embedding-only model must not reach the chat dropdown")
@@ -177,11 +177,11 @@ class TestSaveCatalogHandler(unittest.TestCase):
     def _post(self, payload):
         import json
 
-        from channel.web import web_channel
+        from channel.web.api import models as models_api
 
-        handler = web_channel.ModelsHandler()
-        with patch.object(web_channel, "conf", return_value={}), \
-                patch("channel.web.web_channel.model_catalog.save_catalog",
+        handler = models_api.ModelsHandler()
+        with patch.object(models_api, "conf", return_value={}), \
+                patch("channel.web.api.models.model_catalog.save_catalog",
                       return_value=payload.get("models") or []) as save:
             raw = handler._handle_save_catalog(payload)
         data = json.loads(raw)

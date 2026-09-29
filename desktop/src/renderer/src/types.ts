@@ -52,6 +52,9 @@ export interface ElectronAPI {
   checkForUpdate?: (lang?: string) => Promise<void>
   downloadUpdate?: (lang?: string) => Promise<void>
   installUpdate?: () => Promise<void>
+  // Extra query parameters appended to the update feed URL; {} clears them.
+  // Unused by the standard build.
+  setUpdateFeedQuery?: (params: Record<string, string>) => Promise<void>
   onUpdateStatus?: (callback: (status: UpdateStatus) => void) => () => void
   // Override the window/Dock/taskbar icon and title at runtime (cached across
   // launches). Used by product extensions; unused by the standard build.
@@ -120,10 +123,23 @@ export interface SubStep {
   error?: string
 }
 
+export interface ToolRetrievalMetadata {
+  mode: 'retrieved' | 'fallback'
+  total_mcp_tools: number
+  selected_mcp_tools: number
+  builtin_tools: number
+  top_k: number
+  candidate_count: number
+  selected_tools: string[]
+  ranked_tools: Array<{ name: string; score: number }>
+  fallback_reason?: string | null
+}
+
 /** A single ordered step inside an assistant turn (matches backend history). */
 export interface MessageStep {
-  type: 'thinking' | 'content' | 'tool'
+  type: 'thinking' | 'content' | 'tool' | 'retrieval'
   content?: string
+  retrieval?: ToolRetrievalMetadata
   // tool step fields
   id?: string
   name?: string
@@ -168,6 +184,8 @@ export interface ChatMessage {
   extras?: Record<string, unknown>
   isStreaming?: boolean
   isCancelled?: boolean
+  /** A reply that never reached its answer: cut off (a crash, a quit) or still running. */
+  runState?: RunState
   error?: string
   /** request_id of a server-pushed (scheduler) message, used to dedupe polls. */
   pushRequestId?: string
@@ -299,10 +317,13 @@ export interface ToolCall {
 export type StreamEventType =
   | 'delta'
   | 'reasoning'
+  | 'tool_retrieval'
   | 'tool_start'
   | 'tool_progress'
   | 'tool_end'
   | 'subagent_step'
+  | 'peer_start'
+  | 'peer_end'
   | 'message_end'
   | 'phase'
   | 'file_to_send'
@@ -328,14 +349,29 @@ export interface StreamEvent {
   display?: string
   execution_time?: number
   has_tool_calls?: boolean
+  /** `tool_retrieval`: sanitized MCP retrieval decision metadata. */
+  mode?: 'retrieved' | 'fallback'
+  total_mcp_tools?: number
+  selected_mcp_tools?: number
+  builtin_tools?: number
+  top_k?: number
+  candidate_count?: number
+  selected_tools?: string[]
+  ranked_tools?: Array<{ name: string; score: number }>
+  fallback_reason?: string | null
   /** `tool_end`: true when the call was refused by the session permission mode. */
   permission_denied?: boolean
   /** `tool_end`: the mode that refused the call. */
   permission_mode?: string
+  /** `error`: why the stream ended, e.g. `unknown_request` once the backend restarted. */
+  reason?: string
   /** `subagent_step` event fields: which step of which card, and how it went. */
   card_id?: string
   step_id?: string
   phase?: 'start' | 'end'
+  /** `peer_start` / `peer_end`: the teammate whose turn this is. */
+  agent_id?: string
+  agent_name?: string
   error?: string
   path?: string
   abs_path?: string
@@ -451,7 +487,11 @@ export interface HistoryMessage {
   artifacts?: Artifact[]
   /** Per-message sequence number used by delete/regenerate APIs. */
   _seq?: number
+  /** Set on an assistant turn whose run stopped short of its answer. */
+  run_state?: RunState
 }
+
+export type RunState = 'interrupted' | 'running'
 
 export interface HistoryPage {
   messages: HistoryMessage[]
@@ -460,6 +500,18 @@ export interface HistoryPage {
   page_size: number
   has_more: boolean
   context_start_seq?: number
+}
+
+/** One entry in the navigation timeline: a user message, by its stored seq. */
+export interface UserMessageIndexEntry {
+  seq: number
+  preview: string
+  created_at: number
+}
+
+export interface UserMessageIndex {
+  messages: UserMessageIndexEntry[]
+  total: number
 }
 
 /** Heuristic breakdown of what is occupying the session's context window.
@@ -826,6 +878,69 @@ export interface SkillInfo {
   source?: string
   enabled: boolean
   category?: string
+  ships_with_install?: boolean
+  deletable?: boolean
+}
+
+export type McpTransport = 'stdio' | 'sse' | 'streamable-http'
+export type McpServerStatus = 'pending' | 'ready' | 'failed' | 'needs_auth' | 'disabled' | 'idle' | 'unknown'
+
+export interface McpServerConfig {
+  name: string
+  type?: McpTransport | string
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  url?: string
+  headers?: Record<string, string>
+  scope?: string
+  tool_name_prefix?: string
+  disabled?: boolean
+  timeout?: number
+  status?: McpServerStatus | string
+}
+
+export interface McpServersResult {
+  status: string
+  servers: McpServerConfig[]
+  path?: string
+  hint?: string
+  message?: string
+}
+
+export interface McpTestResult {
+  status: string
+  ok: boolean
+  tools: Array<{ name: string; description?: string }>
+  error?: string | null
+  needs_auth?: boolean
+  message?: string
+}
+
+export type SkillMarketSource = 'hub' | 'github' | 'clawhub'
+
+/** One skill found in a staged fetch or upload, shown for review before installing. */
+export interface SkillPreviewItem {
+  name: string
+  display_name: string
+  description: string
+  source: string
+  skill_md: string
+  skill_md_truncated: boolean
+  has_skill_md: boolean
+  files: string[]
+  file_count: number
+  size: number
+  /** A skill with this name is already installed and would be replaced. */
+  exists: boolean
+}
+
+export interface SkillPreviewResult {
+  status: string
+  message?: string
+  token?: string
+  skills?: SkillPreviewItem[]
+  messages?: string[]
 }
 
 /** Response of GET /api/skills/content: a skill's definition file. */

@@ -42,7 +42,7 @@ class AgentRouter:
         and nothing in the conversation would reveal the substitution.
         """
         try:
-            return self.registry.get(agent_id).id
+            return self.registry.get_addressed(agent_id).id
         except Exception as exc:
             raise AgentUnavailableError(
                 f"{source} selected agent {agent_id!r}, which is missing or disabled"

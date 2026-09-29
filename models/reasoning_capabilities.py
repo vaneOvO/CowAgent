@@ -36,8 +36,11 @@ CLAUDE_MAX_ONLY_MODELS = (
     "claude-opus-4-5",
 )
 DASHSCOPE_QWEN38_MODELS = (
-    # qwen3.8-max/-flash and their -preview snapshots share the low/medium/xhigh
-    # enum (default xhigh) and always think.
+    # qwen3.8-max/-flash (and their -preview snapshots) are HYBRID thinking
+    # models: thinking is on by default but can be turned off via
+    # enable_thinking=false. When thinking IS on they share the
+    # low/medium/xhigh effort enum (default xhigh). They are NOT thinking-only
+    # — the always-thinking variant is qwen3.8-2.4t-a95b, not these.
     "qwen3.8-max",
     "qwen3.8-flash",
 )
@@ -114,7 +117,9 @@ def get_reasoning_capability(provider_id: str, model_name: str = "") -> dict:
         # DashScope proxies several vendors. Keep capabilities model-scoped so
         # unsupported Qwen/GLM/Kimi variants do not inherit another enum set.
         if model.startswith(DASHSCOPE_QWEN38_MODELS):
-            return _capability(DASHSCOPE_QWEN38_VALUES, default="xhigh", thinking_only=True)
+            # Hybrid thinking: effort tiers apply while thinking is enabled, but
+            # the generic thinking toggle can still turn it off entirely.
+            return _capability(DASHSCOPE_QWEN38_VALUES, default="xhigh")
         # deepseek takes the same enum wherever it is hosted; the two
         # variants only differ in how they map the values internally.
         if model.startswith(DEEPSEEK_THINKING_MODELS):

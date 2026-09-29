@@ -26,7 +26,7 @@ from agent.memory import (
     get_conversation_store,
     migrate_conversations_to_global,
 )
-from agent.registry import AgentProfile, AgentRegistry, get_agent_registry, set_agent_registry
+from agent.registry import AgentProfile, AgentRegistry, set_agent_registry
 
 
 def _message(text):
@@ -84,21 +84,22 @@ def _seed_legacy_db(workspace: Path, session_id: str, text: str) -> None:
 
 
 def _install_registry(tmp_path, agent_ids, default_id):
-    previous = get_agent_registry()
     registry = AgentRegistry(
         [AgentProfile(a, a.title(), str(tmp_path / a)) for a in agent_ids],
         default_agent_id=default_id,
     )
     set_agent_registry(registry)
     clear_conversation_store_cache()
-    return previous, registry
+    return registry
 
 
 @pytest.fixture
 def restore_registry():
-    previous = get_agent_registry()
     yield
-    set_agent_registry(previous)
+    # ``None`` rather than the instance from before the test: set_agent_registry
+    # pins process-wide, so putting that instance back would leave configuration
+    # changes ignored and every later test resolving to this test's workspace.
+    set_agent_registry(None)
     clear_conversation_store_cache()
 
 

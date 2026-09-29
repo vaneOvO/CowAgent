@@ -21,6 +21,7 @@ from agent.tools.utils.diff import (
     strip_line_number_prefixes,
 )
 from agent.tools.utils.file_state import note_write, staleness_warning
+from agent.tools.utils.memory_path import feeds_memory_index
 from agent.tools.utils.syntax_check import review as syntax_review
 
 
@@ -217,7 +218,9 @@ class Edit(BaseTool):
                 result["warning"] = " ".join(warnings)
             
             # Notify memory manager if file is in memory directory
-            if self.memory_manager and "memory/" in path:
+            if self.memory_manager and feeds_memory_index(
+                absolute_path, self.memory_manager, self.cwd
+            ):
                 try:
                     self.memory_manager.mark_dirty()
                 except Exception as e:

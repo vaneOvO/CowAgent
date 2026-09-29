@@ -45,27 +45,28 @@ def _capture_headers():
     depends on what else ran first. Patching the name the handler resolves
     keeps these cases independent of that.
     """
-    import channel.web.web_channel as web_channel
+    import channel.web.api.pages as pages_api
 
     sent = []
 
     def _header(name, value=None):
         sent.append((name, value))
 
-    return patch.object(web_channel.web, "header", _header), sent
+    return patch.object(pages_api.web, "header", _header), sent
 
 
 class TestChatHandlerContentType(unittest.TestCase):
 
     def test_chat_page_declares_html_content_type(self):
         """A nosniff proxy cannot sniff, so the type has to be explicit."""
-        from channel.web.web_channel import ChatHandler
+        from channel.web.api.pages import ChatHandler
 
         patcher, sent = _capture_headers()
         with patcher:
-            with patch("channel.web.web_channel._require_auth", lambda: None):
-                with patch("builtins.open", mock_open(read_data="<!doctype html><html></html>")):
-                    ChatHandler().GET()
+            # No auth to stub out: the shell page is public, the API routes
+            # behind it are what _require_auth guards.
+            with patch("builtins.open", mock_open(read_data="<!doctype html><html></html>")):
+                ChatHandler().GET()
 
         content_types = [value for name, value in sent if name.lower() == "content-type"]
         self.assertTrue(

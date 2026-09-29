@@ -290,14 +290,14 @@ class TestConsoleValidation:
     """The models console must not persist a chain that can't do its job."""
 
     def _handler(self):
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         return ModelsHandler.__new__(ModelsHandler)
 
     def _saved(self, monkeypatch, *args, **kwargs):
         written = {}
         monkeypatch.setattr(
-            "channel.web.web_channel.conf", lambda: {"model": "primary-model"}
+            "channel.web.api.models.conf", lambda: {"model": "primary-model"}
         )
         handler = self._handler()
         monkeypatch.setattr(handler, "_read_file_config", lambda: {})
@@ -397,9 +397,10 @@ class TestConsoleValidation:
         so each value must be a list — not the richer PROVIDER_MODELS entry
         ({label, models, ...}) it is derived from."""
         monkeypatch.setattr(
-            "channel.web.web_channel.conf", lambda: {"model": "deepseek-v4-flash"}
+            "channel.web.api.models.conf", lambda: {"model": "deepseek-v4-flash"}
         )
-        from channel.web.web_channel import ConfigHandler, ModelsHandler
+        from channel.web.core import providers
+        from channel.web.api.models import ModelsHandler
 
         cap = ModelsHandler._chat_fallback_capability({})
         provider_models = cap["provider_models"]
@@ -410,15 +411,15 @@ class TestConsoleValidation:
                 assert isinstance(m, str), f"{pid} has a non-string model: {m!r}"
         # Spot-check that the lists were really lifted out of the catalog.
         assert isinstance(
-            ConfigHandler.PROVIDER_MODELS["openai"], dict
+            providers.PROVIDER_MODELS["openai"], dict
         ), "PROVIDER_MODELS entries are dicts — hence the reduction"
         assert "gpt-4o" in provider_models["openai"]
 
     def test_the_capability_exposes_the_saved_chain(self, monkeypatch):
         monkeypatch.setattr(
-            "channel.web.web_channel.conf", lambda: {"model": "deepseek-v4-flash"}
+            "channel.web.api.models.conf", lambda: {"model": "deepseek-v4-flash"}
         )
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         cap = ModelsHandler._chat_fallback_capability({
             "chat_fallback": {
@@ -435,9 +436,9 @@ class TestConsoleValidation:
     def test_a_legacy_config_is_reported_as_a_one_link_chain(self, monkeypatch):
         """An old config.json must still show its backup model in the UI."""
         monkeypatch.setattr(
-            "channel.web.web_channel.conf", lambda: {"model": "deepseek-v4-flash"}
+            "channel.web.api.models.conf", lambda: {"model": "deepseek-v4-flash"}
         )
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         cap = ModelsHandler._chat_fallback_capability({
             "chat_fallback": {"enabled": True, "provider": "openai", "model": "backup-1"}

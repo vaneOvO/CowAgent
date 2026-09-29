@@ -5,16 +5,59 @@ Provides high-level interface for memory operations
 """
 
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Sequence, Tuple
 from pathlib import Path
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from agent.memory.config import MemoryConfig, get_default_memory_config
 from agent.memory.storage import MemoryStorage, MemoryChunk, SearchResult
 from agent.memory.chunker import TextChunker
 from agent.memory.embedding import EmbeddingProvider, EmbeddingCache
+from agent.memory.reranker import Reranker
 from agent.memory.summarizer import MemoryFlushManager, create_memory_files_if_needed
+
+
+def _real(path: Path) -> Path:
+    """Symlink-resolved path, for prefix comparisons that must not care how a
+    directory was reached (``/var`` vs ``/private/var`` on macOS)."""
+    try:
+        return Path(os.path.realpath(path))
+    except OSError:
+        return Path(path)
+
+
+def _index_rel_path(file_path: Path, roots: Sequence[Tuple[Path, str]]) -> Optional[str]:
+    """Index key for a scanned file, or None when no known root contains it.
+
+    Scanned files do not all come from one root: ``common.state_dir`` sends an
+    Agent that has no local ``knowledge/`` of its own to the SHARED root, so
+    sync() legitimately walks files outside the workspace. Keying those off the
+    workspace alone raises ValueError, and because that ran inside sync()'s file
+    loop a single such file aborted the whole sync — taking down every retrieval
+    that goes through the ``search()`` in front of it (#3175).
+
+    Each root carries the prefix its files are keyed under, so shared knowledge
+    keeps the ``knowledge/note.md`` key it would have had inside the workspace:
+    the index keeps its shape when an Agent gains or loses a private copy, and
+    nothing has to be reindexed. Keys are POSIX-style on every platform, which
+    is also the spelling ``add_memory`` writes — otherwise the same file is
+    indexed twice on Windows, once per separator.
+
+    Roots are matched as given first and only then symlink-resolved, so the
+    common case costs no extra stat calls while a workspace reached through a
+    symlink still matches instead of losing its files to the skip path.
+    """
+    for resolve in (False, True):
+        target = _real(file_path) if resolve else file_path
+        for root, prefix in roots:
+            base = _real(root) if resolve else root
+            try:
+                rel = target.relative_to(base)
+            except ValueError:
+                continue
+            return (Path(prefix) / rel).as_posix() if prefix else rel.as_posix()
+    return None
 
 
 class MemoryManager:
@@ -28,15 +71,17 @@ class MemoryManager:
         self,
         config: Optional[MemoryConfig] = None,
         embedding_provider: Optional[EmbeddingProvider] = None,
-        llm_model: Optional[Any] = None
+        llm_model: Optional[Any] = None,
+        reranker: Optional[Reranker] = None
     ):
         """
         Initialize memory manager
-        
+
         Args:
             config: Memory configuration (uses global config if not provided)
             embedding_provider: Custom embedding provider (optional)
             llm_model: LLM model for summarization (optional)
+            reranker: Reranker that reorders search candidates (optional)
         """
         self.config = config or get_default_memory_config()
         
@@ -65,6 +110,8 @@ class MemoryManager:
         # Cache for query embeddings (avoids redundant API calls within a session)
         self._embedding_cache = EmbeddingCache()
 
+        # Optional reranker; None means un-reranked retrieval
+        self.reranker = reranker
 
         # Initialize memory flush manager
         workspace_dir = self.config.get_workspace()
@@ -169,8 +216,10 @@ class MemoryManager:
             self.config.keyword_weight
         )
 
-        # Filter by min score and limit
+        # min_score is a cutoff on the fused score, so it is applied before
+        # rerank; the reranker only reorders the candidates that pass it.
         filtered = [r for r in merged if r.score >= min_score]
+        filtered = self._rerank(query, filtered)
         return filtered[:max_results]
     
     async def add_memory(
@@ -311,14 +360,20 @@ class MemoryManager:
                     scope = "shared"
                 files_to_scan.append((file_path, "memory", scope, user_id))
 
+        from common import state_dir
         from config import conf
+        knowledge_dir: Optional[Path] = None
         if conf().get("knowledge", True):
             # Resolve through state_dir so an Agent without its own knowledge/
             # scans the shared base rather than an empty (or missing) local one.
-            from common import state_dir
             knowledge_dir = Path(state_dir.knowledge_dir(base=workspace_dir))
             if knowledge_dir.exists():
                 for file_path in knowledge_dir.rglob("*.md"):
+                    # The root index.md / log.md only restate pages indexed on
+                    # their own, and change on every page write, which re-embeds
+                    # the whole file each time.
+                    if file_path.parent == knowledge_dir and file_path.name in ("index.md", "log.md"):
+                        continue
                     files_to_scan.append((file_path, "knowledge", "shared", None))
 
         # Pass 1: inline chunking + change detection. Inlined (instead of
@@ -327,13 +382,47 @@ class MemoryManager:
         # where the class object is older than the method's source.
         pending: List[Dict[str, Any]] = []
         workspace_dir_path = self.config.get_workspace()
+        from common.log import logger
+
+        # Roots a scanned file may legitimately sit under, most specific first,
+        # each paired with the prefix its files are keyed under. Resolved once
+        # rather than per file: shared_root() goes through the Agent registry.
+        # knowledge_dir comes first so a knowledge file keys the same whether it
+        # is this Agent's own copy or the shared one it fell back to.
+        index_roots: List[Tuple[Path, str]] = []
+        if knowledge_dir is not None:
+            index_roots.append((knowledge_dir, "knowledge"))
+        index_roots.append((Path(workspace_dir_path), ""))
+        try:
+            index_roots.append((state_dir.shared_root(), ""))
+        except Exception:
+            # No resolvable shared root (registry not ready). The workspace
+            # still covers every file that is not a shared fallback.
+            pass
+
+        scanned: Dict[str, set] = {}
+
         for file_path, source, scope, user_id in files_to_scan:
+            rel_path = _index_rel_path(file_path, index_roots)
+            if rel_path is None:
+                # Defensive: every scan target above resolves under one of the
+                # roots. Skip just this file so one oddity cannot cost the Agent
+                # its whole memory, and say so rather than dropping it silently.
+                logger.warning(
+                    f"[MemoryManager] Skipping {file_path}: it sits under none of "
+                    f"this Agent's roots, so it has no stable index key"
+                )
+                continue
+            # Recorded before the read, so a file that is present but unreadable
+            # still counts as scanned and keeps the rows it already has.
+            scanned.setdefault(source, set()).add(rel_path)
             try:
                 content = file_path.read_text(encoding='utf-8')
-            except Exception:
+            except Exception as e:
+                # Was silent, which made a half-indexed workspace look healthy.
+                logger.warning(f"[MemoryManager] Skipping {file_path}: cannot read it ({e})")
                 continue
             file_hash = MemoryStorage.compute_hash(content)
-            rel_path = str(file_path.relative_to(workspace_dir_path))
             if self.storage.get_file_hash(rel_path) == file_hash:
                 continue
             # Markdown files (memory + knowledge) get structure-aware chunking;
@@ -354,6 +443,41 @@ class MemoryManager:
                 "chunks": chunks,
                 "texts": [c.text for c in chunks],
             })
+
+        # Reconcile before the early return below: an index full of stale rows
+        # is exactly the case where nothing changed and `pending` is empty.
+        #
+        # sync() only ever added and overwrote. Anything that left a scanned
+        # root — a page the user deleted, or every shared page at once when an
+        # Agent is switched to its own knowledge/ — stayed in the index and kept
+        # being returned by memory_search long after no tool could open it.
+        #
+        # Only a source whose root resolved and exists is reconciled. An empty
+        # scan set then means the files are genuinely gone, rather than that the
+        # root was momentarily unresolvable, which must not cost a whole index.
+        reconcilable = []
+        if memory_dir.exists():
+            reconcilable.append("memory")
+        if knowledge_dir is not None and knowledge_dir.exists():
+            reconcilable.append("knowledge")
+        for source in reconcilable:
+            try:
+                stale = set(self.storage.list_paths(source)) - scanned.get(source, set())
+            except Exception as e:
+                logger.warning(f"[MemoryManager] Cannot reconcile {source} index: {e}")
+                continue
+            dropped = 0
+            for stale_path in stale:
+                try:
+                    self.storage.delete_by_path(stale_path)
+                    dropped += 1
+                except Exception as e:
+                    logger.warning(f"[MemoryManager] Cannot drop stale entry {stale_path}: {e}")
+            if dropped:
+                logger.info(
+                    f"[MemoryManager] Dropped {dropped} stale {source} "
+                    f"entries that are no longer on disk"
+                )
 
         if not pending:
             self._dirty = False
@@ -396,6 +520,12 @@ class MemoryManager:
 
             rel_path = entry["rel_path"]
             self.storage.delete_by_path(rel_path)
+            if os.sep != "/":
+                # Keys used to be spelled with the platform separator. Drop that
+                # row too, so a Windows index carried over from an older build
+                # does not keep a second copy of the same file under
+                # "knowledge\note.md" and return it twice.
+                self.storage.delete_by_path(rel_path.replace("/", os.sep))
             memory_chunks = []
             for chunk, embedding in zip(entry["chunks"], entry_embeddings):
                 chunk_id = self._generate_chunk_id(rel_path, chunk.start_line, chunk.end_line)
@@ -482,7 +612,8 @@ class MemoryManager:
             'embedding_enabled': self.embedding_provider is not None,
             'embedding_provider': self.config.embedding_provider if self.embedding_provider else 'disabled',
             'embedding_model': self.config.embedding_model if self.embedding_provider else 'N/A',
-            'search_mode': 'hybrid (vector + keyword)' if self.embedding_provider else 'keyword only (FTS5)'
+            'search_mode': 'hybrid (vector + keyword)' if self.embedding_provider else 'keyword only (FTS5)',
+            'rerank_enabled': self.reranker is not None,
         }
     
     def mark_dirty(self):
@@ -531,6 +662,49 @@ class MemoryManager:
         except (ValueError, OverflowError):
             return 1.0
     
+    @staticmethod
+    def _normalize_weights(vector_weight: float, keyword_weight: float) -> tuple:
+        """Clamp fusion weights into a valid (non-negative, finite) pair.
+
+        The weighted average below is renormalized over only the channels that
+        actually returned a chunk, so only the *ratio* between the two weights
+        matters. Negative and non-finite weights (NaN, +/-inf) are clamped to 0,
+        and an all-zero pair falls back to equal weighting, so a misconfigured
+        value can never produce a negative or meaningless combined score.
+        """
+        import math
+
+        try:
+            v = float(vector_weight)
+            k = float(keyword_weight)
+        except (TypeError, ValueError):
+            return 0.5, 0.5
+        v = v if (math.isfinite(v) and v > 0) else 0.0
+        k = k if (math.isfinite(k) and k > 0) else 0.0
+        if v == 0.0 and k == 0.0:
+            return 0.5, 0.5
+        return v, k
+
+    @staticmethod
+    def _rank_normalize(results: List[SearchResult]) -> Dict[tuple, float]:
+        """Rank-normalize one channel's already-sorted results onto (0, 1].
+
+        ``search_vector`` and ``search_keyword`` both return their results in
+        descending relevance order, so the position index is the rank. The top
+        hit maps to 1.0 and each later hit decays linearly to 1/N. This puts
+        raw cosine similarity and the BM25-derived keyword score — which live
+        on incommensurable scales — onto a common scale before fusion.
+
+        :return: {(path, start_line, end_line): normalized_score}
+        """
+        n = len(results)
+        if n == 0:
+            return {}
+        return {
+            (r.path, r.start_line, r.end_line): (n - i) / n
+            for i, r in enumerate(results)
+        }
+
     def _merge_results(
         self,
         vector_results: List[SearchResult],
@@ -538,40 +712,45 @@ class MemoryManager:
         vector_weight: float,
         keyword_weight: float
     ) -> List[SearchResult]:
-        """Merge vector and keyword search results with temporal decay for dated files"""
-        merged_map = {}
-        
-        for result in vector_results:
+        """Merge vector and keyword search results with temporal decay.
+
+        Each channel is rank-normalized to a common (0, 1] scale first, then a
+        chunk is scored by the weighted average over only the channels that
+        actually returned it. A strong single-channel hit is therefore not
+        diluted by a 0.0 from the missing channel, and the two channels' raw
+        scores no longer have to be comparable to be fused fairly.
+        """
+        vector_weight, keyword_weight = self._normalize_weights(vector_weight, keyword_weight)
+        vector_norm = self._rank_normalize(vector_results)
+        keyword_norm = self._rank_normalize(keyword_results)
+
+        # Keep the first (vector-first) result per chunk for reconstruction;
+        # either channel carries the same snippet/source/path metadata.
+        result_map: Dict[tuple, SearchResult] = {}
+        for result in vector_results + keyword_results:
             key = (result.path, result.start_line, result.end_line)
-            merged_map[key] = {
-                'result': result,
-                'vector_score': result.score,
-                'keyword_score': 0.0
-            }
-        
-        for result in keyword_results:
-            key = (result.path, result.start_line, result.end_line)
-            if key in merged_map:
-                merged_map[key]['keyword_score'] = result.score
-            else:
-                merged_map[key] = {
-                    'result': result,
-                    'vector_score': 0.0,
-                    'keyword_score': result.score
-                }
-        
+            result_map.setdefault(key, result)
+
         merged_results = []
-        for entry in merged_map.values():
-            combined_score = (
-                vector_weight * entry['vector_score'] +
-                keyword_weight * entry['keyword_score']
+        for key in set(vector_norm) | set(keyword_norm):
+            result = result_map[key]
+            vec = vector_norm.get(key)
+            kw = keyword_norm.get(key)
+            hit_v = vec is not None
+            hit_k = kw is not None
+            numerator = (
+                vector_weight * (vec if hit_v else 0.0)
+                + keyword_weight * (kw if hit_k else 0.0)
             )
-            
+            denominator = (
+                (vector_weight if hit_v else 0.0)
+                + (keyword_weight if hit_k else 0.0)
+            )
+            combined_score = (numerator / denominator) if denominator > 0 else 0.0
+
             # Apply temporal decay for dated memory files
-            result = entry['result']
-            decay = self._compute_temporal_decay(result.path)
-            combined_score *= decay
-            
+            combined_score *= self._compute_temporal_decay(result.path)
+
             merged_results.append(SearchResult(
                 path=result.path,
                 start_line=result.start_line,
@@ -581,6 +760,49 @@ class MemoryManager:
                 source=result.source,
                 user_id=result.user_id
             ))
-        
+
         merged_results.sort(key=lambda r: r.score, reverse=True)
         return merged_results
+
+    def _rerank(
+        self,
+        query: str,
+        results: List[SearchResult]
+    ) -> List[SearchResult]:
+        """Reorder candidates by the reranker's relevance scores.
+
+        Replaces each candidate's fused score with the reranker's score (still
+        subject to temporal decay), then re-sorts. Returns ``results``
+        unchanged when no reranker is configured, and falls back to them when
+        rerank fails, the same way vector search degrades to keyword-only.
+        """
+        if self.reranker is None or not results:
+            return results
+
+        from common.log import logger
+
+        try:
+            scores = self.reranker.rerank(query, [r.snippet for r in results])
+            if len(scores) != len(results):
+                raise ValueError(
+                    f"expected {len(results)} scores, got {len(scores)}"
+                )
+        except Exception as e:
+            logger.warning(f"[MemoryManager] Rerank failed, keeping fused order: {e}")
+            return results
+
+        reranked = []
+        for result, score in zip(results, scores):
+            decayed = score * self._compute_temporal_decay(result.path)
+            reranked.append(SearchResult(
+                path=result.path,
+                start_line=result.start_line,
+                end_line=result.end_line,
+                score=decayed,
+                snippet=result.snippet,
+                source=result.source,
+                user_id=result.user_id
+            ))
+
+        reranked.sort(key=lambda r: r.score, reverse=True)
+        return reranked

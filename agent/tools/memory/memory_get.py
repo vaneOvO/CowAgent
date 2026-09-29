@@ -87,15 +87,33 @@ class MemoryGetTool(BaseTool):
             if not path.startswith('memory/') and not path.startswith('knowledge/') and not path.startswith('/') and path != 'MEMORY.md':
                 path = f'memory/{path}'
             
-            file_path = (workspace_dir / path).resolve()
-            workspace_resolved = workspace_dir.resolve()
+            # Roots this path may legitimately resolve under. A "knowledge/"
+            # path goes through state_dir, which sends an Agent with no private
+            # copy of its own to the shared root — the same fallback sync()
+            # indexes through. Resolving it under the workspace alone means the
+            # "knowledge/..." key memory_search just returned cannot be opened
+            # here, which is how such an Agent used to lose every knowledge
+            # page it had just been told about (#3175 follow-up).
+            allowed_roots = [workspace_dir]
+            if path.startswith('knowledge/'):
+                from common import state_dir
+                knowledge_root = state_dir.knowledge_dir(base=workspace_dir)
+                file_path = (knowledge_root / path[len('knowledge/'):]).resolve()
+                allowed_roots.append(knowledge_root)
+            else:
+                file_path = (workspace_dir / path).resolve()
 
             # Use os.path.realpath + os.sep for cross-platform path validation.
             # str(Path).startswith(str + '/') fails on Windows where Path uses
             # backslashes — see MemoryService._resolve_path for the same pattern.
+            # Traversal out of a root ("knowledge/../../etc/passwd") still fails
+            # here, because the check runs on the resolved path.
+            def _contained(real_path: str, root) -> bool:
+                real_root = os.path.realpath(str(root))
+                return real_path == real_root or real_path.startswith(real_root + os.sep)
+
             real_file = os.path.realpath(str(file_path))
-            real_workspace = os.path.realpath(str(workspace_resolved))
-            if real_file != real_workspace and not real_file.startswith(real_workspace + os.sep):
+            if not any(_contained(real_file, root) for root in allowed_roots):
                 return ToolResult.fail(f"Error: Access denied: path outside workspace")
             
             if not file_path.exists():

@@ -4,6 +4,7 @@ import { Shrink, Trash2, Sliders } from 'lucide-react'
 import { apiClient } from '../api/client'
 import { t } from '../i18n'
 import { useChatStore } from '../store/chatStore'
+import { sessionOwner } from '../store/sessionStore'
 import type { ContextUsage } from '../types'
 import ContextUsageDonut, {
   ContextMiniPie,
@@ -81,19 +82,28 @@ const ContextUsagePopover: React.FC<ContextUsagePopoverProps> = ({
   pinnedRef.current = pinned
   const compactingRef = useRef(false)
   compactingRef.current = compacting
+  const usageRef = useRef<ContextUsage | null>(null)
+  usageRef.current = usage
 
   const hasCtx = !!(usage && usage.available && usage.breakdown)
 
   const fetchUsage = useCallback(async (): Promise<ContextUsage | null> => {
     try {
-      const res = await apiClient.getContextUsage(sessionId)
-      const ok = res && res.status !== 'error'
-      const next = ok ? (res as ContextUsage) : null
+      // The session's owner, not whichever Agent is active: instances are keyed
+      // by (agent_id, session_id) server-side, so asking without it looks up the
+      // default Agent and answers available=false for everyone else's sessions.
+      const res = await apiClient.getContextUsage(sessionId, sessionOwner(sessionId) || undefined)
+      if (!res || res.status === 'error') {
+        // Could not ask. Keep the last good reading: this runs on hover, and
+        // blanking the pie mid-session reads as "the context was wiped".
+        // available=false is a real answer and still falls through below.
+        return usageRef.current
+      }
+      const next = res as ContextUsage
       setUsage(next)
       return next
     } catch {
-      setUsage(null)
-      return null
+      return usageRef.current
     }
   }, [sessionId])
 

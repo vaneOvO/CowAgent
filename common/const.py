@@ -128,10 +128,10 @@ QWEN38_FLASH = "qwen3.8-flash"  # Qwen3.8 Flash - Agent recommended model (defau
 QWQ_PLUS = "qwq-plus"
 
 # MiniMax
-MINIMAX_M3 = "MiniMax-M3"  # MiniMax M3 - Latest (default)
+MINIMAX_M3 = "MiniMax-M3"  # MiniMax M3 - Latest (default), native multimodal (vision)
 MINIMAX_M2_7 = "MiniMax-M2.7"  # MiniMax M2.7
 MINIMAX_M2_7_HIGHSPEED = "MiniMax-M2.7-highspeed"  # MiniMax M2.7 highspeed
-MINIMAX_TEXT_01 = "MiniMax-Text-01"  # MiniMax multimodal (vision)
+MINIMAX_TEXT_01 = "MiniMax-Text-01"  # MiniMax Text-01
 MINIMAX_ABAB6_5 = "abab6.5-chat"  # MiniMax abab6.5
 
 # GLM (Zhipu AI)

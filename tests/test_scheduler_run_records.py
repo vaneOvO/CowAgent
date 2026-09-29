@@ -12,12 +12,11 @@ from agent.memory import (
     clear_conversation_store_cache,
     get_conversation_store,
 )
-from agent.registry import AgentProfile, AgentRegistry, get_agent_registry, set_agent_registry
+from agent.registry import AgentProfile, AgentRegistry, set_agent_registry
 
 
 @pytest.fixture
 def one_agent(tmp_path):
-    previous = get_agent_registry()
     registry = AgentRegistry(
         [AgentProfile("default", "Default", str(tmp_path / "default"))],
         default_agent_id="default",
@@ -27,7 +26,10 @@ def one_agent(tmp_path):
     try:
         yield registry
     finally:
-        set_agent_registry(previous)
+        # ``None``, not the instance from before the test: set_agent_registry
+        # pins process-wide, so restoring that instance would leave the
+        # registry pinned and outlive this test.
+        set_agent_registry(None)
         clear_conversation_store_cache()
 
 

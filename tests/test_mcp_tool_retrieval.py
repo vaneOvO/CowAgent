@@ -266,7 +266,12 @@ class TestSelectToolsForInjection(unittest.TestCase):
         self.assertEqual(len(result), len(fake.tools))
 
     def test_degrade_no_provider_returns_all_tools(self):
-        """Maintainer scenario 2: no embedding provider → full injection."""
+        """Maintainer scenario 2: no embedding provider → full injection.
+
+        Fallback is diagnostic-only: it must degrade safely to full injection
+        and must NOT emit a client-facing ``tool_retrieval`` event (the reason
+        is logged for troubleshooting instead).
+        """
         fake = self._make_self(mcp_count=25)  # > threshold
         fake_tm = _FakeToolManager(tool_vectors={}, query_vectors=[None])
         with patch("config.conf", return_value=self._conf()), \
@@ -274,17 +279,7 @@ class TestSelectToolsForInjection(unittest.TestCase):
             result = self._call(fake)
         self.assertEqual(len(result), len(fake.tools))
         retrieval_events = [event for event in fake.events if event["type"] == "tool_retrieval"]
-        self.assertEqual(len(retrieval_events), 1)
-        self.assertEqual(retrieval_events[0]["data"]["mode"], "fallback")
-        self.assertEqual(
-            retrieval_events[0]["data"]["fallback_reason"],
-            "missing_query_vector",
-        )
-        self.assertEqual(retrieval_events[0]["data"]["selected_mcp_tools"], 25)
-        self.assertEqual(
-            retrieval_events[0]["data"]["selected_tools"],
-            sorted(f"mcp_{i}" for i in range(25)),
-        )
+        self.assertEqual(retrieval_events, [])
 
     def test_builtins_always_injected_and_set_grows(self):
         """Maintainer scenario 3: multi-turn MCP set only grows; builtins stay."""

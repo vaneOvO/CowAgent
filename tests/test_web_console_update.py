@@ -141,29 +141,29 @@ def test_web_handlers_auth_and_no_github_on_version(monkeypatch):
         web_stub.input = lambda **kwargs: types.SimpleNamespace(**kwargs)
         sys.modules["web"] = web_stub
 
-    from channel.web import web_channel
+    from channel.web.api import update as update_api
 
     monkeypatch.setattr(
         "cli.update_service.fetch_github_releases",
         lambda timeout=20: (_ for _ in ()).throw(AssertionError("no github on version")),
     )
-    with patch("channel.web.web_channel.web.header"):
-        payload = json.loads(web_channel.VersionHandler().GET())
+    with patch("channel.web.api.update.web.header"):
+        payload = json.loads(update_api.VersionHandler().GET())
     assert "version" in payload
     assert "update_supported" in payload
 
-    with patch("channel.web.web_channel._require_auth") as require_auth, \
-         patch("channel.web.web_channel.web.header"), \
+    with patch("channel.web.api.update._require_auth") as require_auth, \
+         patch("channel.web.api.update.web.header"), \
          patch("cli.update_service.check_for_updates", return_value={"status": "success", "up_to_date": True, "newer_releases": [], "latest": None, "current_release": None, "current_version": "2.1.8"}):
-        body = json.loads(web_channel.UpdateCheckHandler().POST())
+        body = json.loads(update_api.UpdateCheckHandler().POST())
     require_auth.assert_called_once_with()
     assert body["status"] == "success"
     assert body["up_to_date"] is True
 
-    with patch("channel.web.web_channel._require_auth") as require_status, \
-         patch("channel.web.web_channel.web.header"), \
+    with patch("channel.web.api.update._require_auth") as require_status, \
+         patch("channel.web.api.update.web.header"), \
          patch("cli.update_service.read_update_status", return_value={"state": "idle"}):
-        status = json.loads(web_channel.UpdateStatusHandler().GET())
+        status = json.loads(update_api.UpdateStatusHandler().GET())
     require_status.assert_called_once_with()
     assert status["state"] == "idle"
 
@@ -194,9 +194,14 @@ def test_status_roundtrip(tmp_path):
 
 def test_frontend_contract():
     root = Path(__file__).parents[1]
-    html = (root / "channel/web/chat.html").read_text(encoding="utf-8")
-    js = (root / "channel/web/static/js/console.js").read_text(encoding="utf-8")
-    py = (root / "channel/web/web_channel.py").read_text(encoding="utf-8")
+    # The page is assembled from templates/ and the scripts were split into a
+    # core/ and views/ tree, so assert against what is actually served.
+    from channel.web.core import template
+    from conftest import console_js, web_backend_py
+
+    html = template.render("chat.html")
+    js = console_js()
+    py = web_backend_py()
     assert 'id="update-menu"' in html
     assert 'id="sidebar-version"' in html
     assert 'id="update-dot"' in html

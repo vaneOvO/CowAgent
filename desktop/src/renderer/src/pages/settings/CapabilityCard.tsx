@@ -89,8 +89,11 @@ const CapabilityCard: React.FC<CapabilityCardProps> = ({
   const modelOptions: DropdownOption[] = useMemo(() => {
     const list = resolveModels(data, provider, state.provider_models).map((o) => ({
       value: o.value,
-      label: o.value,
-      hint: o.hint,
+      // An empty value is an explicit "use the default" option (e.g. LinkAI
+      // ASR). It has no model id to show, so fall back to its hint as the
+      // label; otherwise the row and the selected trigger would render blank.
+      label: o.value || o.hint || t('models_default_option'),
+      hint: o.value ? o.hint : undefined,
     }))
     // Keep the currently-saved model selectable even if it's not in the preset list.
     if (model && !showCustom && !list.some((o) => o.value === model)) {

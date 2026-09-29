@@ -7,8 +7,8 @@ import random
 import requests
 
 from bridge.reply import Reply, ReplyType
-from common import const
 from common.log import logger
+from common.tmp_dir import TmpDir
 from common.utils import apply_client_source, apply_cloud_user
 from config import conf
 from voice import audio_convert
@@ -26,10 +26,12 @@ class LinkAIVoice(Voice):
             headers = {"Authorization": "Bearer " + conf().get("linkai_api_key")}
             apply_client_source(headers)
             apply_cloud_user(headers)
-            # Pin whisper-1: gateway ignores any other ASR model id.
-            model = const.WHISPER_1
-            # Whisper only accepts amr/mp3/wav/m4a; WeChat voice notes arrive as
-            # .silk/.slk, so normalise the extension before deciding.
+            # Gateway routes ASR by `model` (whisper-1 / doubao / baidu). An
+            # empty value means "use the gateway's default engine", so only
+            # forward `model` when the user actually configured one.
+            model = (conf().get("voice_to_text_model") or "").strip()
+            # Some engines only accept amr/mp3/wav/m4a; WeChat voice notes arrive
+            # as .silk/.slk, so normalise the extension before deciding.
             lower = voice_file.lower()
             if lower.endswith(".amr") or lower.endswith(".silk") or lower.endswith(".slk"):
                 try:
@@ -38,12 +40,13 @@ class LinkAIVoice(Voice):
                     voice_file = mp3_file
                 except Exception as e:
                     logger.warning(f"[LinkVoice] voice file transfer failed, directly send voice file: {e}")
+            data = {"model": model} if model else {}
             with open(voice_file, "rb") as file:
                 res = requests.post(
                     url,
                     files={"file": file},
                     headers=headers,
-                    data={"model": model},
+                    data=data,
                     timeout=(5, 60),
                 )
             if res.status_code != 200:
@@ -86,8 +89,7 @@ class LinkAIVoice(Voice):
                     pass
                 logger.error(f"[LinkVoice] textToVoice error, status_code={res.status_code}, msg={msg}")
                 return None
-            tmp_file_name = "tmp/" + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + str(random.randint(0, 1000)) + ".mp3"
-            os.makedirs(os.path.dirname(tmp_file_name), exist_ok=True)
+            tmp_file_name = TmpDir().path() + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + str(random.randint(0, 1000)) + ".mp3"
             with open(tmp_file_name, 'wb') as f:
                 f.write(res.content)
             logger.info(f"[LinkVoice] textToVoice success, input={text}, voice_id={data.get('voice')}")

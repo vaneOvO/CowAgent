@@ -10,9 +10,8 @@ import os
 import shutil
 import zipfile
 import tempfile
-from typing import Dict, List, Optional
+from typing import List, Optional
 from common.log import logger
-from agent.skills.types import Skill, SkillEntry
 from agent.skills.manager import SkillManager
 
 try:
@@ -91,6 +90,16 @@ class SkillService:
         self.manager.refresh_skills()
         config = self.manager.get_skills_config()
         result = list(config.values())
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            entry = self.manager.get_skill(name) if name else None
+            if entry is not None:
+                item["ships_with_install"] = self._ships_with_install(entry.skill)
+            else:
+                item["ships_with_install"] = item.get("source") == "builtin"
+            item["deletable"] = not item["ships_with_install"]
         logger.info(f"[SkillService] query: {len(result)} skills found")
         return result
 

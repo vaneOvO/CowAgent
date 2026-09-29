@@ -6,8 +6,10 @@ from pathlib import Path
 import pytest
 import web
 
-from channel.web import openai_api, web_channel
-from channel.web.openai_api import (
+from channel.web import web_channel
+from channel.web.core import channel as channel_core
+from channel.web.api import openai_compat
+from channel.web.api.openai_compat import (
     OpenAIAPIError,
     handle_chat_completions,
 )
@@ -39,9 +41,9 @@ def _runner(events, calls):
 
 def _http_app(monkeypatch, run_chat, configured_token="secret"):
     monkeypatch.setattr(
-        openai_api, "conf", lambda: {"external_api_token": configured_token}
+        openai_compat, "conf", lambda: {"external_api_token": configured_token}
     )
-    monkeypatch.setattr(openai_api, "_run_chat_service", run_chat)
+    monkeypatch.setattr(openai_compat, "_run_chat_service", run_chat)
     return web.application(
         ("/v1/chat/completions", "OpenAIChatCompletionsHandler"),
         vars(web_channel),
@@ -133,7 +135,7 @@ def test_cancel_agent_request_uses_bridge_scoped_key(monkeypatch):
     )
     monkeypatch.setattr("agent.protocol.get_cancel_registry", lambda: FakeRegistry())
 
-    assert openai_api._cancel_agent_request("request-1", agent_id="research") is True
+    assert openai_compat._cancel_agent_request("request-1", agent_id="research") is True
     assert calls == [
         ("resolve", "research"),
         ("scope", "research", "request-1", "primary"),
@@ -151,12 +153,12 @@ def test_late_cancel_does_not_cancel_new_request_in_same_session(monkeypatch):
 
     monkeypatch.setattr("agent.protocol.get_cancel_registry", lambda: registry)
     monkeypatch.setattr(
-        openai_api,
+        openai_compat,
         "_request_cancel_key",
         lambda request_id, agent_id=None: request_id,
     )
 
-    assert openai_api._cancel_agent_request("request-old") is False
+    assert openai_compat._cancel_agent_request("request-old") is False
     assert not old_event.is_set()
     assert not new_event.is_set()
 
@@ -426,7 +428,7 @@ def test_streaming_generator_close_cancels_agent_request_once(monkeypatch):
         release_runner.wait()
 
     monkeypatch.setattr(
-        openai_api,
+        openai_compat,
         "_cancel_agent_request",
         lambda request_id, agent_id=None: cancel_calls.append((request_id, agent_id)),
         raising=False,
@@ -459,8 +461,8 @@ def test_streaming_timeout_while_waiting_for_session_lock_skips_run_chat(monkeyp
 
     registry = CancelTokenRegistry()
     session_id = "openai:conversation:queued-timeout"
-    session_lock = openai_api._SESSION_LOCKS[
-        hash(session_id) % len(openai_api._SESSION_LOCKS)
+    session_lock = openai_compat._SESSION_LOCKS[
+        hash(session_id) % len(openai_compat._SESSION_LOCKS)
     ]
     run_calls = []
     session_writes = []
@@ -470,17 +472,17 @@ def test_streaming_timeout_while_waiting_for_session_lock_skips_run_chat(monkeyp
         run_calls.append((args, kwargs))
         session_writes.append(args[1])
 
-    monkeypatch.setattr(openai_api, "_FIRST_EVENT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(openai_compat, "_FIRST_EVENT_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr("agent.protocol.get_cancel_registry", lambda: registry)
     monkeypatch.setattr(
-        openai_api,
+        openai_compat,
         "_request_cancel_scope",
         lambda request_id, session_id=None, agent_id=None: (
             request_id,
             session_id,
         ),
     )
-    monkeypatch.setattr(openai_api, "_cancel_agent_request", lambda *args: False)
+    monkeypatch.setattr(openai_compat, "_cancel_agent_request", lambda *args: False)
 
     session_lock.acquire()
     try:
@@ -566,7 +568,7 @@ def test_streaming_timeout_after_closed_check_reuses_pre_registered_cancel_event
 
     monkeypatch.setattr("bridge.bridge.Bridge", FakeBridge)
     monkeypatch.setattr("agent.protocol.get_cancel_registry", lambda: registry)
-    monkeypatch.setattr(openai_api, "_FIRST_EVENT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(openai_compat, "_FIRST_EVENT_TIMEOUT_SECONDS", 0.05)
 
     def request():
         try:
@@ -617,8 +619,8 @@ def test_streaming_generator_close_while_waiting_for_session_lock_skips_run_chat
 ):
     real_queue = queue.Queue
     session_id = "openai:conversation:queued-close"
-    session_lock = openai_api._SESSION_LOCKS[
-        hash(session_id) % len(openai_api._SESSION_LOCKS)
+    session_lock = openai_compat._SESSION_LOCKS[
+        hash(session_id) % len(openai_compat._SESSION_LOCKS)
     ]
     run_calls = []
     session_writes = []
@@ -655,8 +657,8 @@ def test_streaming_generator_close_while_waiting_for_session_lock_skips_run_chat
         run_calls.append((args, kwargs))
         session_writes.append(args[1])
 
-    monkeypatch.setattr(openai_api.queue, "Queue", PrimedQueue)
-    monkeypatch.setattr(openai_api, "_cancel_agent_request", lambda *args: False)
+    monkeypatch.setattr(openai_compat.queue, "Queue", PrimedQueue)
+    monkeypatch.setattr(openai_compat, "_cancel_agent_request", lambda *args: False)
 
     session_lock.acquire()
     try:
@@ -694,7 +696,7 @@ def test_streaming_generator_close_while_waiting_for_session_lock_skips_run_chat
 def test_streaming_normal_completion_does_not_cancel_agent_request(monkeypatch):
     cancel_calls = []
     monkeypatch.setattr(
-        openai_api,
+        openai_compat,
         "_cancel_agent_request",
         lambda request_id, agent_id=None: cancel_calls.append((request_id, agent_id)),
         raising=False,
@@ -728,7 +730,7 @@ def test_encoded_stream_close_propagates_to_source():
             close_calls.append("closed")
 
     source = Source()
-    stream = openai_api._encode_stream(source)
+    stream = openai_compat._encode_stream(source)
 
     assert next(stream) == b"data: first\n\n"
     stream.close()
@@ -788,8 +790,9 @@ def test_web_channel_binds_openai_chat_route(monkeypatch):
     channel = web_channel.WebChannel()
     monkeypatch.setattr(channel, "_cleanup_stale_voice_recordings", lambda: None)
     monkeypatch.setattr(web_channel.web, "application", capture_application)
+    # WebChannel reads the host and port, and it lives in core.channel.
     monkeypatch.setattr(
-        web_channel,
+        channel_core,
         "conf",
         lambda: {"web_host": "127.0.0.1", "web_port": 9899},
     )
@@ -804,7 +807,7 @@ def test_web_channel_binds_openai_chat_route(monkeypatch):
     ) in route_pairs
     assert (
         captured["namespace"]["OpenAIChatCompletionsHandler"]
-        is openai_api.OpenAIChatCompletionsHandler
+        is openai_compat.OpenAIChatCompletionsHandler
     )
     assert captured["autoreload"] is False
 
@@ -914,9 +917,9 @@ def test_http_stream_first_event_timeout_returns_500_and_cancels(monkeypatch):
         runner_started.set()
         release_runner.wait()
 
-    monkeypatch.setattr(openai_api, "_FIRST_EVENT_TIMEOUT_SECONDS", 0.01, raising=False)
+    monkeypatch.setattr(openai_compat, "_FIRST_EVENT_TIMEOUT_SECONDS", 0.01, raising=False)
     monkeypatch.setattr(
-        openai_api,
+        openai_compat,
         "_cancel_agent_request",
         lambda request_id, agent_id=None: cancel_calls.append((request_id, agent_id)),
         raising=False,

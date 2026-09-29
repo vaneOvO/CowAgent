@@ -13,15 +13,15 @@ import json
 
 import web
 
-from channel.web import web_channel as wc
-from channel.web.web_channel import ChannelsHandler
+from channel.web.api import channels as channels_api
+from channel.web.api.channels import ChannelsHandler
 
 
 def _dispatch(monkeypatch, body, *, multi_agent):
     """Run ChannelsHandler.POST for ``body`` and record which handler it hit."""
     calls = []
 
-    monkeypatch.setattr(wc, "_require_auth", lambda: None)
+    monkeypatch.setattr(channels_api, "_require_auth", lambda: None)
     monkeypatch.setattr(web, "header", lambda *a, **k: None)
     monkeypatch.setattr(web, "data", lambda: json.dumps(body).encode("utf-8"))
 
@@ -127,11 +127,11 @@ def _disconnect_env(monkeypatch, tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(_json.dumps(cfg), encoding="utf-8")
 
-    monkeypatch.setattr(wc, "conf", lambda: cfg)
+    monkeypatch.setattr(channels_api, "conf", lambda: cfg)
     monkeypatch.setattr(ci, "conf", lambda: cfg, raising=False)
-    monkeypatch.setattr(wc, "get_data_root", lambda: str(tmp_path))
+    monkeypatch.setattr(channels_api, "get_data_root", lambda: str(tmp_path))
     monkeypatch.setattr(
-        wc, "_read_config_file_for_write",
+        channels_api, "_read_config_file_for_write",
         lambda: _json.loads(config_path.read_text(encoding="utf-8")),
     )
 

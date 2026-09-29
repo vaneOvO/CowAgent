@@ -13,7 +13,7 @@ from agent.memory import (
     set_global_memory_config,
 )
 from common.runtime_identity import identity_scope
-from agent.registry import AgentProfile, AgentRegistry, get_agent_registry, set_agent_registry
+from agent.registry import AgentProfile, AgentRegistry, set_agent_registry
 from agent.tools.scheduler.integration import (
     get_scheduler_service,
     get_task_store,
@@ -32,7 +32,6 @@ def isolated_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(
         SchedulerService, "stop", lambda service: setattr(service, "running", False)
     )
-    previous = get_agent_registry()
     registry = AgentRegistry(
         [
             AgentProfile("primary", "Primary", str(tmp_path / "primary")),
@@ -50,7 +49,10 @@ def isolated_registry(tmp_path, monkeypatch):
         reset_memory_configs()
         reset_scheduler_services()
         clear_conversation_store_cache()
-        set_agent_registry(previous)
+        # ``None``, not the instance from before the test: set_agent_registry
+        # pins process-wide, so restoring that instance would leave the
+        # registry pinned and outlive this test.
+        set_agent_registry(None)
 
 
 @pytest.fixture

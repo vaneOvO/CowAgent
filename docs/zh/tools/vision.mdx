@@ -26,10 +26,10 @@ Vision 工具采用多级自动选择 + 自动兜底策略，无需手动配置�
 | Kimi (Moonshot) | 使用主模型 | kimi-k2.6、kimi-k2.5 原生支持 |
 | 百度千帆 (Qianfan) | 使用主模型 | 默认使用多模态主模型 (如 ernie-5.1)，主模型不支持时兜底使用 ernie-4.5-turbo-vl |
 | 智谱 AI | 主模型 / glm-5v-turbo | glm-5.3-flash 直接使用；纯文本 chat 模型回落到 glm-5v-turbo |
-| MiniMax | MiniMax-Text-01 | 固定使用视觉专用模型 |
+| MiniMax | MiniMax-M3 | 使用所选的原生多模态模型 |
 
 <Note>
-  智谱和 MiniMax 的文本模型不支持图像理解，因此始终使用对应的视觉专用模型，无需手动指定。
+  智谱和 MiniMax 的纯文本模型不支持图像理解；MiniMax 会自动选择原生多模态的 MiniMax-M3，无需手动指定。
 </Note>
 
 > 当 `use_linkai=true` 时，默认使用 LinkAI 的多模态模型进行
